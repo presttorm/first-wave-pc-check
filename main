@@ -1,4 +1,22 @@
-$isAdmin = [System.Security.Principal.WindowsPrincipal]::new([System.Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+#Requires -RunAsAdministrator
+<#
+.SYNOPSIS
+    Professional Windows DFIR Forensic Triage Tool
+.DESCRIPTION
+    Comprehensive forensic collection and analysis for incident response.
+    Read-only where possible. All findings scored by severity.
+.NOTES
+    Author: Based on original by lily
+    Use: Incident Response, Threat Hunting, Forensic Triage
+#>
+
+# ============================================================
+# INITIALIZATION & ADMIN CHECK
+# ============================================================
+$isAdmin = [System.Security.Principal.WindowsPrincipal]::new(
+    [System.Security.Principal.WindowsIdentity]::GetCurrent()
+).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+
 if (-not $isAdmin) {
     Write-Host "`n╔══════════════════════════════════════════════════╗" -ForegroundColor Red
     Write-Host "║           ADMINISTRATOR PRIVILEGES REQUIRED       ║" -ForegroundColor Red
@@ -7,921 +25,1168 @@ if (-not $isAdmin) {
     exit
 }
 
+# ============================================================
+# GLOBAL SCORING & IOC TRACKING
+# ============================================================
+$script:Findings = [System.Collections.Generic.List[PSCustomObject]]::new()
+$script:IOCs      = [System.Collections.Generic.List[PSCustomObject]]::new()
+$script:Timeline  = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+function Add-Finding {
+    param(
+        [string]$Category,
+        [string]$Finding,
+        [ValidateSet("Informational","Low","Medium","High","Critical")]
+        [string]$Severity = "Informational",
+        [string]$Detail = ""
+    )
+    $script:Findings.Add([PSCustomObject]@{
+        Time     = Get-Date
+        Category = $Category
+        Finding  = $Finding
+        Severity = $Severity
+        Detail   = $Detail
+    })
+}
+
+function Add-IOC {
+    param([string]$Type, [string]$Value, [string]$Context)
+    $script:IOCs.Add([PSCustomObject]@{
+        Type    = $Type
+        Value   = $Value
+        Context = $Context
+    })
+}
+
+function Add-TimelineEvent {
+    param([datetime]$Time, [string]$Category, [string]$Description)
+    $script:Timeline.Add([PSCustomObject]@{
+        Time        = $Time
+        Category    = $Category
+        Description = $Description
+    })
+}
+
+function Write-SectionHeader {
+    param([string]$Title)
+    $line = "=" * 60
+    Write-Host "`n$line" -ForegroundColor DarkCyan
+    Write-Host "  $Title" -ForegroundColor Cyan
+    Write-Host "$line" -ForegroundColor DarkCyan
+}
+
+function Write-Finding {
+    param(
+        [string]$Message,
+        [ValidateSet("Informational","Low","Medium","High","Critical")]
+        [string]$Severity = "Informational"
+    )
+    $colors = @{
+        Informational = "White"
+        Low           = "Green"
+        Medium        = "Yellow"
+        High          = "Red"
+        Critical      = "Magenta"
+    }
+    $prefix = @{
+        Informational = "  [INFO]    "
+        Low           = "  [LOW]     "
+        Medium        = "  [MEDIUM]  "
+        High          = "  [HIGH]    "
+        Critical      = "  [CRITICAL]"
+    }
+    Write-Host "$($prefix[$Severity]) $Message" -ForegroundColor $colors[$Severity]
+}
+
 Write-Host "made with love by lily<3" -ForegroundColor Cyan
+Write-Host "DFIR Triage Tool - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor DarkCyan
 Write-Host ""
 
 # ============================================================
-# SYSTEM BOOT TIME
+# SECTION 1: SYSTEM INFORMATION
 # ============================================================
+Write-SectionHeader "SYSTEM INFORMATION"
+
 try {
-    $bootTime = (Get-CimInstance -ClassName Win32_OperatingSystem).LastBootUpTime
-    $uptime = (Get-Date) - $bootTime
-    Write-Host "SYSTEM BOOT TIME" -ForegroundColor Cyan
-    Write-Host ("  Last Boot: {0}" -f $bootTime.ToString("yyyy-MM-dd HH:mm:ss")) -ForegroundColor White
-    Write-Host ("  Uptime: {0} days, {1:D2}:{2:D2}:{3:D2}" -f $uptime.Days, $uptime.Hours, $uptime.Minutes, $uptime.Seconds) -ForegroundColor White
-    
+    $os  = Get-CimInstance Win32_OperatingSystem
+    $cs  = Get-CimInstance Win32_ComputerSystem
+    $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+
+    $bootTime = $os.LastBootUpTime
+    $uptime   = (Get-Date) - $bootTime
+
+    Write-Host "  Hostname:      $($cs.Name)" -ForegroundColor White
+    Write-Host "  Domain:        $($cs.Domain)" -ForegroundColor White
+    Write-Host "  OS:            $($os.Caption) Build $($os.BuildNumber)" -ForegroundColor White
+    Write-Host "  Architecture:  $($os.OSArchitecture)" -ForegroundColor White
+    Write-Host "  CPU:           $($cpu.Name)" -ForegroundColor White
+    Write-Host "  RAM:           $([math]::Round($cs.TotalPhysicalMemory/1GB,1)) GB" -ForegroundColor White
+    Write-Host ("  Last Boot:     {0}" -f $bootTime.ToString("yyyy-MM-dd HH:mm:ss")) -ForegroundColor White
+    Write-Host ("  Uptime:        {0}d {1:D2}h {2:D2}m" -f $uptime.Days, $uptime.Hours, $uptime.Minutes) -ForegroundColor White
+
     if ($uptime.TotalMinutes -lt 10) {
-        Write-Host "  WARNING: System was recently rebooted (possible evidence clearing)" -ForegroundColor Red
+        Write-Finding "System rebooted very recently - possible evidence clearing" "High"
+        Add-Finding "System" "Very recent reboot" "High" "Uptime < 10 minutes"
+        Add-TimelineEvent (Get-Date) "System" "System rebooted recently"
     }
+
+    # Logged-on users
+    $loggedUsers = Get-CimInstance Win32_LoggedOnUser -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty Antecedent | Select-Object -Unique
+    Write-Host "  Current Users: $($loggedUsers.Count)" -ForegroundColor White
+
 } catch {
-    Write-Host "Unable to retrieve boot time information" -ForegroundColor Red
+    Write-Finding "Unable to retrieve system info: $($_.Exception.Message)" "Medium"
 }
 
 # ============================================================
-# CONNECTED DRIVES
+# SECTION 2: CONNECTED DRIVES
 # ============================================================
-$drives = Get-CimInstance -ClassName Win32_LogicalDisk | Where-Object { $_.DriveType -ne 5 }
-if ($drives) {
-    Write-Host "`nCONNECTED DRIVES" -ForegroundColor Cyan
-    foreach ($drive in $drives) {
-        Write-Host ("  {0}: {1}" -f $drive.DeviceID, $drive.FileSystem) -ForegroundColor Green
+Write-SectionHeader "CONNECTED DRIVES"
+
+$drives = Get-CimInstance Win32_LogicalDisk | Where-Object { $_.DriveType -ne 5 }
+foreach ($drive in $drives) {
+    $freeGB  = [math]::Round($drive.FreeSpace / 1GB, 1)
+    $totalGB = [math]::Round($drive.Size / 1GB, 1)
+    Write-Host ("  {0}: {1,-10} {2}/{3} GB free  Type:{4}" -f
+        $drive.DeviceID, $drive.FileSystem, $freeGB, $totalGB, $drive.DriveType) -ForegroundColor Green
+
+    # USB/removable drives are forensically significant
+    if ($drive.DriveType -eq 2) {
+        Write-Finding "Removable drive connected: $($drive.DeviceID)" "Medium"
+        Add-Finding "Storage" "Removable drive present" "Medium" $drive.DeviceID
     }
 }
 
 # ============================================================
-# SERVICE STATUS
+# SECTION 3: SERVICE STATUS
 # ============================================================
-Write-Host "`nSERVICE STATUS" -ForegroundColor Cyan
+Write-SectionHeader "FORENSIC SERVICE STATUS"
 
+# Services critical for forensic artifact generation
 $services = @(
-    @{Name = "SysMain";    DisplayName = "SysMain"},
-    @{Name = "PcaSvc";     DisplayName = "Program Compatibility Assistant Service"},
-    @{Name = "DPS";        DisplayName = "Diagnostic Policy Service"},
-    @{Name = "EventLog";   DisplayName = "Windows Event Log"},
-    @{Name = "Schedule";   DisplayName = "Task Scheduler"},
-    @{Name = "Bam";        DisplayName = "Background Activity Moderator"},
-    @{Name = "Dusmsvc";    DisplayName = "Data Usage"},
-    @{Name = "Appinfo";    DisplayName = "Application Information"},
-    @{Name = "CDPSvc";     DisplayName = "Connected Devices Platform Service"},
-    @{Name = "DcomLaunch"; DisplayName = "DCOM Server Process Launcher"},
-    @{Name = "PlugPlay";   DisplayName = "Plug and Play"},
-    @{Name = "wsearch";    DisplayName = "Windows Search"}
+    @{Name="SysMain";    Display="SysMain (Prefetch)";          ForensicNote="Prefetch data"},
+    @{Name="PcaSvc";     Display="Program Compatibility Asst";  ForensicNote="App compat telemetry"},
+    @{Name="DPS";        Display="Diagnostic Policy Svc";       ForensicNote="Diagnostic logs"},
+    @{Name="EventLog";   Display="Windows Event Log";           ForensicNote="CRITICAL - all audit logs"},
+    @{Name="Schedule";   Display="Task Scheduler";              ForensicNote="Scheduled task artifacts"},
+    @{Name="Bam";        Display="Background Activity Monitor"; ForensicNote="Execution history"},
+    @{Name="wsearch";    Display="Windows Search";              ForensicNote="Search index"},
+    @{Name="wuauserv";   Display="Windows Update";              ForensicNote="Update history"},
+    @{Name="WinDefend";  Display="Windows Defender";            ForensicNote="AV protection"},
+    @{Name="mpssvc";     Display="Windows Firewall";            ForensicNote="Network filtering"},
+    @{Name="PlugPlay";   Display="Plug and Play";               ForensicNote="Device history"},
+    @{Name="Appinfo";    Display="Application Information";     ForensicNote="UAC elevation events"}
 )
 
 foreach ($svc in $services) {
-    $service = Get-Service -Name $svc.Name -ErrorAction SilentlyContinue
-    if ($service) {
-        if ($service.Status -eq "Running") {
-            $displayName = $service.DisplayName
-            if ($displayName.Length -gt 40) { $displayName = $displayName.Substring(0, 37) + "..." }
-            Write-Host ("  {0,-12} {1,-40}" -f $svc.Name, $displayName) -ForegroundColor Green -NoNewline
-            if ($svc.Name -eq "Bam") {
-                Write-Host " | Enabled" -ForegroundColor Yellow
-            } else {
-                try {
-                    $process = Get-CimInstance Win32_Service -Filter "Name='$($svc.Name)'" | Select-Object ProcessId
-                    if ($process.ProcessId -gt 0) {
-                        $proc = Get-Process -Id $process.ProcessId -ErrorAction SilentlyContinue
-                        if ($proc) {
-                            Write-Host (" | {0}" -f $proc.StartTime.ToString("HH:mm:ss")) -ForegroundColor Yellow
-                        } else { Write-Host " | N/A" -ForegroundColor Yellow }
-                    } else { Write-Host " | N/A" -ForegroundColor Yellow }
-                } catch { Write-Host " | N/A" -ForegroundColor Yellow }
-            }
-        } else {
-            $displayName = $service.DisplayName
-            if ($displayName.Length -gt 40) { $displayName = $displayName.Substring(0, 37) + "..." }
-            Write-Host ("  {0,-12} {1,-40} {2}" -f $svc.Name, $displayName, $service.Status) -ForegroundColor Red
+    $s = Get-Service -Name $svc.Name -ErrorAction SilentlyContinue
+    if ($s) {
+        $color = if ($s.Status -eq "Running") { "Green" } else { "Red" }
+        Write-Host ("  {0,-12} {1,-32} [{2}]  // {3}" -f
+            $svc.Name, $svc.Display, $s.Status, $svc.ForensicNote) -ForegroundColor $color
+
+        if ($s.Status -ne "Running" -and $svc.Name -in @("EventLog","WinDefend","mpssvc")) {
+            Write-Finding "CRITICAL forensic service stopped: $($svc.Name)" "Critical"
+            Add-Finding "Services" "Critical service stopped: $($svc.Name)" "Critical" $svc.ForensicNote
         }
     } else {
-        Write-Host ("  {0,-12} {1,-40} {2}" -f $svc.Name, "Not Found", "Stopped") -ForegroundColor Yellow
+        Write-Host ("  {0,-12} {1,-32} [Not Found]" -f $svc.Name, $svc.Display) -ForegroundColor Yellow
     }
 }
 
 # ============================================================
-# REGISTRY CHECKS
+# SECTION 4: WINDOWS DEFENDER - COMPREHENSIVE
 # ============================================================
-Write-Host "`nREGISTRY" -ForegroundColor Cyan
+Write-SectionHeader "WINDOWS DEFENDER - COMPREHENSIVE STATUS"
 
-$settings = @(
-    @{ Name = "CMD";                  Path = "HKCU:\Software\Policies\Microsoft\Windows\System";                              Key = "DisableCMD";                Warning = "Disabled"; Safe = "Available" },
-    @{ Name = "PowerShell Logging";   Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging";      Key = "EnableScriptBlockLogging";  Warning = "Disabled"; Safe = "Enabled" },
-    @{ Name = "Activities Cache";     Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System";                             Key = "EnableActivityFeed";        Warning = "Disabled"; Safe = "Enabled" },
-    @{ Name = "Prefetch Enabled";     Path = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters"; Key = "EnablePrefetcher"; Warning = "Disabled"; Safe = "Enabled" }
-)
+try {
+    $mpStatus = Get-MpComputerStatus -ErrorAction SilentlyContinue
 
-foreach ($s in $settings) {
-    $status = Get-ItemProperty -Path $s.Path -Name $s.Key -ErrorAction SilentlyContinue
-    Write-Host "  " -NoNewline
-    if ($status -and $status.$($s.Key) -eq 0) {
-        Write-Host "$($s.Name): " -NoNewline -ForegroundColor White
-        Write-Host "$($s.Warning)" -ForegroundColor Red
+    if ($mpStatus) {
+        # Core protection status
+        $fields = @(
+            @{F="AntivirusEnabled";           Label="Antivirus Enabled";         Invert=$false},
+            @{F="RealTimeProtectionEnabled";  Label="Real-Time Protection";      Invert=$false},
+            @{F="IsTamperProtected";          Label="Tamper Protection";         Invert=$false},
+            @{F="AntispywareEnabled";         Label="Antispyware Enabled";       Invert=$false},
+            @{F="BehaviorMonitorEnabled";     Label="Behavior Monitor";          Invert=$false},
+            @{F="IoavProtectionEnabled";      Label="IOAV Protection";           Invert=$false},
+            @{F="NISEnabled";                 Label="Network Inspection System"; Invert=$false},
+            @{F="OnAccessProtectionEnabled";  Label="On-Access Protection";      Invert=$false}
+        )
+
+        foreach ($f in $fields) {
+            $val = $mpStatus.$($f.F)
+            $ok  = if ($f.Invert) { -not $val } else { $val }
+            $sev = if (-not $ok) { "High" } else { "Informational" }
+            $txt = if ($val) { "Enabled" } else { "DISABLED" }
+            Write-Finding "$($f.Label): $txt" $(if ($ok) { "Informational" } else { "High" })
+            if (-not $ok) { Add-Finding "Defender" "$($f.Label) is disabled" "High" "" }
+        }
+
+        # Versions and update times
+        Write-Host ""
+        Write-Host "  Engine Version:       $($mpStatus.AMEngineVersion)" -ForegroundColor White
+        Write-Host "  Platform Version:     $($mpStatus.AMProductVersion)" -ForegroundColor White
+        Write-Host "  Signature Version:    $($mpStatus.AntivirusSignatureVersion)" -ForegroundColor White
+        Write-Host "  Signature Age:        $($mpStatus.AntivirusSignatureAge) days" -ForegroundColor $(if ($mpStatus.AntivirusSignatureAge -gt 7) { "Yellow" } else { "Green" })
+        Write-Host "  Last Quick Scan:      $($mpStatus.QuickScanStartTime)" -ForegroundColor White
+        Write-Host "  Last Full Scan:       $($mpStatus.FullScanStartTime)" -ForegroundColor White
+        Write-Host "  Last Signature Update:$($mpStatus.AntivirusSignatureLastUpdated)" -ForegroundColor White
+
+        if ($mpStatus.AntivirusSignatureAge -gt 7) {
+            Add-Finding "Defender" "Signatures outdated ($($mpStatus.AntivirusSignatureAge) days)" "Medium" ""
+        }
+
+        # SmartScreen
+        $ssReg = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" `
+            -Name SmartScreenEnabled -ErrorAction SilentlyContinue
+        Write-Host "  SmartScreen:          $($ssReg.SmartScreenEnabled)" -ForegroundColor White
+
+        # Controlled Folder Access
+        Write-Host "  Controlled Folder Access: $($mpStatus.EnableControlledFolderAccess)" -ForegroundColor White
+
+        # ASR Rules
+        Write-Host "`n  ASR Rules:" -ForegroundColor Cyan
+        try {
+            $mpPref = Get-MpPreference -ErrorAction SilentlyContinue
+            if ($mpPref.AttackSurfaceReductionRules_Ids) {
+                for ($i = 0; $i -lt $mpPref.AttackSurfaceReductionRules_Ids.Count; $i++) {
+                    $ruleId    = $mpPref.AttackSurfaceReductionRules_Ids[$i]
+                    $ruleAction= $mpPref.AttackSurfaceReductionRules_Actions[$i]
+                    $actionName= switch ($ruleAction) {
+                        0 { "Disabled" } 1 { "Block" } 2 { "Audit" } 6 { "Warn" } default { "Unknown($ruleAction)" }
+                    }
+                    $color = switch ($ruleAction) { 1 { "Green" } 2 { "Yellow" } default { "Red" } }
+                    Write-Host ("    Rule: {0}  Action: {1}" -f $ruleId, $actionName) -ForegroundColor $color
+                }
+            } else {
+                Write-Finding "No ASR rules configured" "Medium"
+            }
+        } catch { Write-Finding "Unable to retrieve ASR rules" "Low" }
+
+        # Exclusions (forensically critical - attackers add exclusions)
+        Write-Host "`n  Defender Exclusions:" -ForegroundColor Cyan
+        try {
+            $mpPref = Get-MpPreference -ErrorAction SilentlyContinue
+
+            foreach ($excType in @("ExclusionPath","ExclusionProcess","ExclusionExtension","ExclusionIpAddress")) {
+                $excList = $mpPref.$excType
+                if ($excList -and $excList.Count -gt 0) {
+                    Write-Finding "$excType ($($excList.Count) entries) - REVIEW REQUIRED" "High"
+                    foreach ($exc in $excList) {
+                        Write-Host "      $exc" -ForegroundColor Yellow
+                        Add-Finding "Defender" "Exclusion: $excType = $exc" "High" "Attackers add exclusions to evade detection"
+                        Add-IOC "DefenderExclusion" $exc $excType
+                    }
+                } else {
+                    Write-Host "    $excType`: None" -ForegroundColor Green
+                }
+            }
+        } catch { Write-Finding "Unable to read exclusions" "Low" }
+
     } else {
-        Write-Host "$($s.Name): " -NoNewline -ForegroundColor White
-        Write-Host "$($s.Safe)" -ForegroundColor Green
+        Write-Finding "Windows Defender status unavailable" "High"
     }
+} catch {
+    Write-Finding "Error querying Defender: $($_.Exception.Message)" "Medium"
 }
 
-# Additional registry checks
+# Defender Detection/Threat History
+Write-Host "`n  Defender Threat History:" -ForegroundColor Cyan
+try {
+    $threats = Get-MpThreatDetection -ErrorAction SilentlyContinue | Sort-Object InitialDetectionTime -Descending | Select-Object -First 20
+    if ($threats) {
+        foreach ($t in $threats) {
+            Write-Finding "Threat detected: $($t.ThreatName) | Action:$($t.ActionSuccess) | $($t.InitialDetectionTime)" "High"
+            Add-Finding "Defender" "Threat: $($t.ThreatName)" "High" "Detected: $($t.InitialDetectionTime)"
+            Add-IOC "MalwareDetection" $t.ThreatName "Defender detection"
+            Add-TimelineEvent $t.InitialDetectionTime "DefenderDetection" $t.ThreatName
+        }
+    } else {
+        Write-Host "    No recent threat detections" -ForegroundColor Green
+    }
+} catch { Write-Finding "Unable to retrieve threat history" "Low" }
+
+# Active threats
+try {
+    $activeThreats = Get-MpThreat -ErrorAction SilentlyContinue
+    if ($activeThreats) {
+        foreach ($at in $activeThreats) {
+            Write-Finding "ACTIVE THREAT: $($at.ThreatName) Severity:$($at.SeverityID)" "Critical"
+            Add-Finding "Defender" "ACTIVE THREAT: $($at.ThreatName)" "Critical" ""
+        }
+    }
+} catch {}
+
+# Defender event log
+Write-Host "`n  Defender Event Log (recent detections):" -ForegroundColor Cyan
+try {
+    $defEvents = Get-WinEvent -LogName "Microsoft-Windows-Windows Defender/Operational" `
+        -FilterXPath "*[System[EventID=1116 or EventID=1117 or EventID=1118 or EventID=1119]]" `
+        -MaxEvents 10 -ErrorAction SilentlyContinue
+    if ($defEvents) {
+        foreach ($ev in $defEvents) {
+            Write-Finding "Defender Event $($ev.Id): $($ev.Message.Split("`n")[0])" "High"
+            Add-TimelineEvent $ev.TimeCreated "DefenderEvent" "ID:$($ev.Id)"
+        }
+    } else {
+        Write-Host "    No Defender detection events in log" -ForegroundColor Green
+    }
+} catch { Write-Finding "Unable to read Defender event log" "Low" }
+
+# ============================================================
+# SECTION 5: REGISTRY - COMPREHENSIVE
+# ============================================================
+Write-SectionHeader "REGISTRY ANALYSIS"
+
+# Core forensic settings
 $regChecks = @(
-    @{ Name = "Windows Defender Disabled";    Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender";      Key = "DisableAntiSpyware" },
-    @{ Name = "UAC Disabled";                 Path = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"; Key = "EnableLUA" },
-    @{ Name = "Audit Policy Tampered";        Path = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa";              Key = "AuditBaseObjects" },
-    @{ Name = "Remote Registry Enabled";      Path = "HKLM:\SYSTEM\CurrentControlSet\Services\RemoteRegistry";  Key = "Start" },
-    @{ Name = "Firewall Disabled (Domain)";   Path = "HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\DomainProfile";  Key = "EnableFirewall" },
-    @{ Name = "Firewall Disabled (Private)";  Path = "HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\PrivateProfile"; Key = "EnableFirewall" }
+    @{Name="CMD Disabled";                Path="HKCU:\Software\Policies\Microsoft\Windows\System";                              Key="DisableCMD";                Warn=1; WarnMsg="CMD is disabled"},
+    @{Name="PowerShell Script Block Log"; Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging";      Key="EnableScriptBlockLogging";  Warn=0; WarnMsg="Script Block Logging disabled"},
+    @{Name="Activity Feed";               Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows\System";                             Key="EnableActivityFeed";        Warn=0; WarnMsg="Activity Feed disabled"},
+    @{Name="Prefetch";                    Path="HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters"; Key="EnablePrefetcher"; Warn=0; WarnMsg="Prefetch disabled - evidence source lost"},
+    @{Name="Defender Disabled (Policy)";  Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender";                          Key="DisableAntiSpyware";        Warn=1; WarnMsg="Defender disabled via policy"},
+    @{Name="UAC Disabled";                Path="HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System";             Key="EnableLUA";                 Warn=0; WarnMsg="UAC is disabled"},
+    @{Name="Remote Registry";             Path="HKLM:\SYSTEM\CurrentControlSet\Services\RemoteRegistry";                      Key="Start";                     Warn=2; WarnMsg="Remote Registry enabled (Start=2)"},
+    @{Name="AMSI Disabled";               Path="HKLM:\SOFTWARE\Microsoft\AMSI";                                               Key="DisableAMSI";               Warn=1; WarnMsg="AMSI disabled"},
+    @{Name="PowerShell Module Log";       Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging";          Key="EnableModuleLogging";       Warn=0; WarnMsg="Module logging disabled"},
+    @{Name="RDP Enabled";                 Path="HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server";                      Key="fDenyTSConnections";        Warn=0; WarnMsg="RDP is enabled"},
+    @{Name="WDigest Plaintext Auth";      Path="HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest";            Key="UseLogonCredential";        Warn=1; WarnMsg="WDigest enabled - plaintext creds in memory"},
+    @{Name="SafeBoot Altered";            Path="HKLM:\SYSTEM\CurrentControlSet\Control\SafeBoot\Option";                      Key="OptionValue";               Warn=1; WarnMsg="SafeBoot settings modified"},
+    @{Name="AppInit DLLs";                Path="HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows";                  Key="AppInit_DLLs";              Warn=""; WarnMsg="AppInit_DLLs set - common persistence/injection"},
+    @{Name="IFEO GlobalFlag";             Path="HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"; Key="GlobalFlag";            Warn=1; WarnMsg="IFEO GlobalFlag set"}
 )
 
 foreach ($r in $regChecks) {
     $val = Get-ItemProperty -Path $r.Path -Name $r.Key -ErrorAction SilentlyContinue
-    Write-Host "  $($r.Name): " -NoNewline -ForegroundColor White
-    if ($val) {
-        Write-Host "Value=$($val.$($r.Key)) (manual review recommended)" -ForegroundColor Yellow
+    Write-Host ("  {0,-35}" -f $r.Name) -NoNewline -ForegroundColor White
+
+    if ($null -ne $val -and $null -ne $val.$($r.Key)) {
+        $v = $val.$($r.Key)
+        if ($r.Warn -eq "" -and $v -ne "") {
+            # Non-empty string is the warning condition
+            Write-Host "[$v] WARNING: $($r.WarnMsg)" -ForegroundColor Red
+            Add-Finding "Registry" $r.WarnMsg "High" "Value: $v"
+            Add-IOC "RegistryPersistence" "$($r.Path)\$($r.Key)" $r.WarnMsg
+        } elseif ($v -eq $r.Warn) {
+            Write-Host "[$v] WARNING: $($r.WarnMsg)" -ForegroundColor Red
+            Add-Finding "Registry" $r.WarnMsg "High" "Value: $v"
+        } else {
+            Write-Host "[$v] OK" -ForegroundColor Green
+        }
     } else {
-        Write-Host "Not set / Default" -ForegroundColor Green
+        Write-Host "Not set (default)" -ForegroundColor Green
     }
 }
 
+# IFEO Debugger Hijacks - a common persistence/injection technique
+Write-Host "`n  IFEO Debugger Hijacks:" -ForegroundColor Cyan
+try {
+    $ifeoBase = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+    $ifeoKeys = Get-ChildItem $ifeoBase -ErrorAction SilentlyContinue
+    foreach ($key in $ifeoKeys) {
+        $debugger = Get-ItemProperty -Path $key.PSPath -Name "Debugger" -ErrorAction SilentlyContinue
+        if ($debugger -and $debugger.Debugger) {
+            Write-Finding "IFEO Debugger set on $($key.PSChildName): $($debugger.Debugger)" "High"
+            Add-Finding "Registry" "IFEO Debugger hijack: $($key.PSChildName)" "High" $debugger.Debugger
+            Add-IOC "IFEOHijack" $key.PSChildName $debugger.Debugger
+        }
+    }
+} catch { Write-Finding "Unable to enumerate IFEO keys" "Low" }
+
+# USB Device History (forensically valuable)
+Write-Host "`n  USB Device History:" -ForegroundColor Cyan
+try {
+    $usbDevices = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Enum\USB\*\*" -ErrorAction SilentlyContinue |
+        Select-Object FriendlyName, Mfg, LocationInformation
+    foreach ($usb in $usbDevices | Where-Object { $_.FriendlyName }) {
+        Write-Host ("    {0}" -f $usb.FriendlyName) -ForegroundColor White
+        Add-TimelineEvent (Get-Date) "USB" "USB device history: $($usb.FriendlyName)"
+    }
+} catch { Write-Finding "Unable to read USB history" "Low" }
+
+# MRU (Most Recently Used) - shows recent user activity
+Write-Host "`n  Recent Run Commands (MRU):" -ForegroundColor Cyan
+try {
+    $runMRU = Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\RunMRU" -ErrorAction SilentlyContinue
+    if ($runMRU) {
+        $runMRU.PSObject.Properties | Where-Object { $_.Name -notlike "PS*" -and $_.Name -ne "MRUList" } |
+            ForEach-Object { Write-Host "    $($_.Name): $($_.Value)" -ForegroundColor White }
+    }
+} catch { Write-Finding "Unable to read RunMRU" "Low" }
+
+# Typed URLs
+Write-Host "`n  Typed URLs (IE/Edge MRU):" -ForegroundColor Cyan
+try {
+    $typedURLs = Get-ItemProperty "HKCU:\Software\Microsoft\Internet Explorer\TypedURLs" -ErrorAction SilentlyContinue
+    if ($typedURLs) {
+        $typedURLs.PSObject.Properties | Where-Object { $_.Name -like "url*" } |
+            ForEach-Object { Write-Host "    $($_.Value)" -ForegroundColor White }
+    }
+} catch { Write-Finding "Unable to read TypedURLs" "Low" }
+
+# Network profiles
+Write-Host "`n  Known Network Profiles:" -ForegroundColor Cyan
+try {
+    $netProfiles = Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Profiles" -ErrorAction SilentlyContinue
+    foreach ($np in $netProfiles) {
+        $prof = Get-ItemProperty $np.PSPath -ErrorAction SilentlyContinue
+        Write-Host ("    {0}  Category:{1}" -f $prof.ProfileName, $prof.Category) -ForegroundColor White
+    }
+} catch { Write-Finding "Unable to read network profiles" "Low" }
+
 # ============================================================
-# EVENT LOG HELPER FUNCTIONS
+# SECTION 6: WINDOWS EVENT LOGS - DEEP ANALYSIS
 # ============================================================
-function Check-EventLog {
-    param ($logName, $eventID, $message)
-    $event = Get-WinEvent -LogName $logName -FilterXPath "*[System[EventID=$eventID]]" -MaxEvents 1 -ErrorAction SilentlyContinue
-    if ($event) {
-        Write-Host "  $message at: " -NoNewline -ForegroundColor White
-        Write-Host $event.TimeCreated.ToString("MM/dd HH:mm") -ForegroundColor Yellow
-    } else {
-        Write-Host "  $message - No records found" -ForegroundColor Green
+Write-SectionHeader "EVENT LOG ANALYSIS"
+
+function Get-RecentEvents {
+    param([string]$LogName, [int[]]$IDs, [int]$MaxEvents = 5, [string]$Description)
+    try {
+        $xPath = "*[System[" + (($IDs | ForEach-Object { "EventID=$_" }) -join " or ") + "]]"
+        $events = Get-WinEvent -LogName $LogName -FilterXPath $xPath -MaxEvents $MaxEvents -ErrorAction SilentlyContinue
+        return $events
+    } catch { return $null }
+}
+
+# Log clearing - critical forensic indicator
+Write-Host "  Log Clearing Events:" -ForegroundColor Cyan
+$logClears = Get-RecentEvents "Security" @(1102) 10 "Audit log cleared"
+if ($logClears) {
+    foreach ($ev in $logClears) {
+        Write-Finding "Security audit log cleared at $($ev.TimeCreated)" "Critical"
+        Add-Finding "EventLogs" "Audit log cleared" "Critical" $ev.TimeCreated.ToString()
+        Add-TimelineEvent $ev.TimeCreated "LogClearing" "Security audit log cleared"
+    }
+} else { Write-Host "    No audit log clearing events" -ForegroundColor Green }
+
+$sysLogClears = Get-RecentEvents "System" @(104) 10 "System log cleared"
+if ($sysLogClears) {
+    foreach ($ev in $sysLogClears) {
+        Write-Finding "System log cleared at $($ev.TimeCreated)" "High"
+        Add-TimelineEvent $ev.TimeCreated "LogClearing" "System log cleared"
+    }
+} else { Write-Host "    No system log clearing events" -ForegroundColor Green }
+
+# Failed logons
+Write-Host "`n  Failed Logon Events (4625):" -ForegroundColor Cyan
+$failedLogons = Get-RecentEvents "Security" @(4625) 10 "Failed logon"
+if ($failedLogons) {
+    Write-Finding "Failed logon attempts: $($failedLogons.Count) recent" $(if ($failedLogons.Count -gt 5) { "High" } else { "Medium" })
+    foreach ($ev in $failedLogons) {
+        Write-Host ("    $($ev.TimeCreated.ToString('MM/dd HH:mm')) - $($ev.Message.Split("`n") | Select-String 'Account Name' | Select-Object -First 1)") -ForegroundColor Yellow
+    }
+} else { Write-Host "    No recent failed logons" -ForegroundColor Green }
+
+# Successful logons
+Write-Host "`n  Successful Logons (4624):" -ForegroundColor Cyan
+$successLogons = Get-RecentEvents "Security" @(4624) 5 "Successful logon"
+if ($successLogons) {
+    foreach ($ev in $successLogons) {
+        Write-Host ("    $($ev.TimeCreated.ToString('MM/dd HH:mm'))") -ForegroundColor White
     }
 }
 
-function Check-RecentEventLog {
-    param ($logName, $eventIDs, $message)
-    $event = Get-WinEvent -LogName $logName -FilterXPath "*[System[EventID=$($eventIDs -join ' or EventID=')]]" -MaxEvents 1 -ErrorAction SilentlyContinue
-    if ($event) {
-        Write-Host "  $message (ID: $($event.Id)) at: " -NoNewline -ForegroundColor White
-        Write-Host $event.TimeCreated.ToString("MM/dd HH:mm") -ForegroundColor Yellow
-    } else {
-        Write-Host "  $message - No records found" -ForegroundColor Green
+# RDP logons
+Write-Host "`n  RDP Logon Events:" -ForegroundColor Cyan
+$rdpLogons = Get-RecentEvents "Security" @(4778,4779) 5 "RDP session"
+if ($rdpLogons) {
+    foreach ($ev in $rdpLogons) {
+        Write-Finding "RDP session event at $($ev.TimeCreated)" "Medium"
+        Add-TimelineEvent $ev.TimeCreated "RDP" "RDP session ID:$($ev.Id)"
     }
-}
+} else { Write-Host "    No RDP session events" -ForegroundColor Green }
 
-function Check-DeviceDeleted {
-    try {
-        $event = Get-WinEvent -LogName "Microsoft-Windows-Kernel-PnP/Configuration" -FilterXPath "*[System[EventID=400]]" -MaxEvents 1 -ErrorAction SilentlyContinue
-        if ($event) {
-            Write-Host "  Device configuration changed at: " -NoNewline -ForegroundColor White
-            Write-Host $event.TimeCreated.ToString("MM/dd HH:mm") -ForegroundColor Yellow
-            return
-        }
-    } catch {}
-    try {
-        $event = Get-WinEvent -FilterHashtable @{LogName="System"; ID=225} -MaxEvents 1 -ErrorAction SilentlyContinue
-        if ($event) {
-            Write-Host "  Device removed at: " -NoNewline -ForegroundColor White
-            Write-Host $event.TimeCreated.ToString("MM/dd HH:mm") -ForegroundColor Yellow
-            return
-        }
-    } catch {}
-    try {
-        $events = Get-WinEvent -LogName "System" | Where-Object {$_.Id -eq 225 -or $_.Id -eq 400} | Sort-Object TimeCreated -Descending | Select-Object -First 1
-        if ($events) {
-            Write-Host "  Last device change at: " -NoNewline -ForegroundColor White
-            Write-Host $events.TimeCreated.ToString("MM/dd HH:mm") -ForegroundColor Yellow
-            return
-        }
-    } catch {}
-    Write-Host "  Device changes - No records found" -ForegroundColor Green
-}
+# New user accounts
+Write-Host "`n  User Account Creation (4720):" -ForegroundColor Cyan
+$newUsers = Get-RecentEvents "Security" @(4720) 5 "User created"
+if ($newUsers) {
+    foreach ($ev in $newUsers) {
+        Write-Finding "New user account created at $($ev.TimeCreated)" "High"
+        Add-Finding "UserAccounts" "New user created" "High" $ev.TimeCreated.ToString()
+        Add-TimelineEvent $ev.TimeCreated "UserCreation" "New user account created"
+    }
+} else { Write-Host "    No recent user creation events" -ForegroundColor Green }
 
-# ============================================================
-# EVENT LOGS
-# ============================================================
-Write-Host "`nEVENT LOGS" -ForegroundColor Cyan
-
-Check-EventLog "Application" 3079 "USN Journal cleared"
-Check-RecentEventLog "System" @(104, 1102) "Event Logs cleared"
-Check-EventLog "System" 1074 "Last PC Shutdown"
-Check-EventLog "Security" 4616 "System time changed"
-Check-EventLog "System" 6005 "Event Log Service started"
-Check-DeviceDeleted
-
-# Extra event log checks
-Write-Host "`nEVENT LOGS (EXTENDED)" -ForegroundColor Cyan
-
-# Audit log cleared (Security log)
-$auditCleared = Get-WinEvent -LogName "Security" -FilterXPath "*[System[EventID=1102]]" -MaxEvents 5 -ErrorAction SilentlyContinue
-if ($auditCleared) {
-    Write-Host "  Security Audit Log cleared $($auditCleared.Count) time(s), last at: " -NoNewline -ForegroundColor White
-    Write-Host $auditCleared[0].TimeCreated.ToString("MM/dd HH:mm") -ForegroundColor Red
-} else {
-    Write-Host "  Security Audit Log cleared - No records found" -ForegroundColor Green
-}
-
-# User account created
-$userCreated = Get-WinEvent -LogName "Security" -FilterXPath "*[System[EventID=4720]]" -MaxEvents 3 -ErrorAction SilentlyContinue
-if ($userCreated) {
-    Write-Host "  User account created recently at: " -NoNewline -ForegroundColor White
-    Write-Host $userCreated[0].TimeCreated.ToString("MM/dd HH:mm") -ForegroundColor Yellow
-} else {
-    Write-Host "  User account creation - No recent records" -ForegroundColor Green
-}
+# Group membership changes
+Write-Host "`n  Group Membership Changes (4732/4756):" -ForegroundColor Cyan
+$groupChanges = Get-RecentEvents "Security" @(4732,4756) 5 "Group change"
+if ($groupChanges) {
+    foreach ($ev in $groupChanges) {
+        Write-Finding "Group membership changed at $($ev.TimeCreated)" "High"
+        Add-TimelineEvent $ev.TimeCreated "GroupChange" "Group membership modified"
+    }
+} else { Write-Host "    No recent group changes" -ForegroundColor Green }
 
 # Privilege escalation
-$privEsc = Get-WinEvent -LogName "Security" -FilterXPath "*[System[EventID=4672]]" -MaxEvents 1 -ErrorAction SilentlyContinue
-if ($privEsc) {
-    Write-Host "  Special privileges assigned at: " -NoNewline -ForegroundColor White
-    Write-Host $privEsc.TimeCreated.ToString("MM/dd HH:mm") -ForegroundColor Yellow
-} else {
-    Write-Host "  Special privilege assignment - No records" -ForegroundColor Green
+Write-Host "`n  Special Privilege Use (4672):" -ForegroundColor Cyan
+$privUse = Get-RecentEvents "Security" @(4672) 3 "Special privileges"
+if ($privUse) {
+    Write-Host "    Last special privilege use: $($privUse[0].TimeCreated)" -ForegroundColor Yellow
 }
 
-# Process creation logging (4688)
-$procCreate = Get-WinEvent -LogName "Security" -FilterXPath "*[System[EventID=4688]]" -MaxEvents 1 -ErrorAction SilentlyContinue
+# Process creation (4688) - requires audit policy
+Write-Host "`n  Process Creation Audit (4688):" -ForegroundColor Cyan
+$procCreate = Get-RecentEvents "Security" @(4688) 1 "Process creation"
 if ($procCreate) {
-    Write-Host "  Process creation audit last at: " -NoNewline -ForegroundColor White
-    Write-Host $procCreate.TimeCreated.ToString("MM/dd HH:mm") -ForegroundColor Yellow
+    Write-Host "    Process creation auditing: ENABLED (last event $($procCreate[0].TimeCreated))" -ForegroundColor Green
 } else {
-    Write-Host "  Process creation audit - No records (may be disabled)" -ForegroundColor Yellow
+    Write-Finding "Process creation auditing (4688) not enabled or no events" "Medium"
+    Add-Finding "AuditPolicy" "Process creation auditing disabled" "Medium" "Reduces forensic visibility"
 }
 
-# ============================================================
-# PREFETCH INTEGRITY
-# ============================================================
-$prefetchPath = "$env:SystemRoot\Prefetch"
-if (Test-Path $prefetchPath) {
-    Write-Host "`nPREFETCH INTEGRITY" -ForegroundColor Cyan
-
-    $files = Get-ChildItem -Path $prefetchPath -Filter *.pf -Force -ErrorAction SilentlyContinue
-    if (-not $files) {
-        Write-Host "  No prefetch found?? Check the folder please" -ForegroundColor Yellow
-    } else {
-        $hashTable         = @{}
-        $suspiciousFiles   = @{}
-        $totalFiles        = $files.Count
-        $hiddenFiles       = @()
-        $readOnlyFiles     = @()
-        $hiddenAndReadOnlyFiles = @()
-        $errorFiles        = @()
-
-        foreach ($file in $files) {
-            try {
-                $isHidden   = $file.Attributes -band [System.IO.FileAttributes]::Hidden
-                $isReadOnly = $file.Attributes -band [System.IO.FileAttributes]::ReadOnly
-
-                if ($isHidden -and $isReadOnly) {
-                    $hiddenAndReadOnlyFiles += $file
-                    if (-not $suspiciousFiles.ContainsKey($file.Name)) { $suspiciousFiles[$file.Name] = "Hidden and Read-only" }
-                } elseif ($isHidden) {
-                    $hiddenFiles += $file
-                    if (-not $suspiciousFiles.ContainsKey($file.Name)) { $suspiciousFiles[$file.Name] = "Hidden file" }
-                } elseif ($isReadOnly) {
-                    $readOnlyFiles += $file
-                    if (-not $suspiciousFiles.ContainsKey($file.Name)) { $suspiciousFiles[$file.Name] = "Read-only file" }
-                }
-
-                $hash = Get-FileHash -Path $file.FullName -Algorithm SHA256 -ErrorAction SilentlyContinue
-                if ($hash) {
-                    if ($hashTable.ContainsKey($hash.Hash)) {
-                        $hashTable[$hash.Hash].Add($file.Name)
-                    } else {
-                        $hashTable[$hash.Hash] = [System.Collections.Generic.List[string]]::new()
-                        $hashTable[$hash.Hash].Add($file.Name)
-                    }
-                }
-            } catch {
-                $errorFiles += $file
-                if (-not $suspiciousFiles.ContainsKey($file.Name)) { $suspiciousFiles[$file.Name] = "Error analyzing file: $($_.Exception.Message)" }
-            }
-        }
-
-        if ($hiddenAndReadOnlyFiles.Count -gt 0) {
-            Write-Host "  Hidden & Read-only Files: $($hiddenAndReadOnlyFiles.Count) found" -ForegroundColor Yellow
-            foreach ($file in $hiddenAndReadOnlyFiles) { Write-Host ("    {0}" -f $file.Name) -ForegroundColor White }
-        }
-
-        if ($hiddenFiles.Count -gt 0) {
-            Write-Host "  Hidden Files: $($hiddenFiles.Count) found" -ForegroundColor Yellow
-            foreach ($file in $hiddenFiles) { Write-Host ("    {0}" -f $file.Name) -ForegroundColor White }
-        } else {
-            Write-Host "  Hidden Files: None" -ForegroundColor Green
-        }
-
-        if ($readOnlyFiles.Count -gt 0) {
-            Write-Host "  Read-Only Files: $($readOnlyFiles.Count)" -ForegroundColor Yellow
-            foreach ($file in $readOnlyFiles) { Write-Host ("    {0}" -f $file.Name) -ForegroundColor White }
-        } else {
-            Write-Host "  Read-Only Files: None" -ForegroundColor Green
-        }
-
-        $repeatedHashes = $hashTable.GetEnumerator() | Where-Object { $_.Value.Count -gt 1 }
-        if ($repeatedHashes) {
-            Write-Host "  Duplicate Files: $($repeatedHashes.Count) sets found" -ForegroundColor Yellow
-            foreach ($entry in $repeatedHashes) {
-                foreach ($file in $entry.Value) {
-                    if (-not $suspiciousFiles.ContainsKey($file)) { $suspiciousFiles[$file] = "Duplicate file" }
-                }
-                Write-Host ("    Duplicate set: {0}" -f ($entry.Value -join ", ")) -ForegroundColor White
-            }
-        } else {
-            Write-Host "  Duplicates: None" -ForegroundColor Green
-        }
-
-        # Check for known cheat engine / injector prefetch names
-        $knownCheatNames = @(
-            "CHEATENGINE", "CE64", "CHEAT ENGINE",
-            "XENOS", "XENOS64", "XENOINJECTOR",
-            "INJECTOR", "DLLINJECTOR", "DLINJECT",
-            "EXTREMEINJECTOR",
-            "PROCESSHACKER", "PROCESSHACKER2",
-            "ARTMONEY",
-            "WIRESHARK", "RAWCAP", "FIDDLER",
-            "OLLYDBG", "X64DBG", "X32DBG", "WINDBG", "IMMUNITY",
-            "RECLASS", "RECLASS64",
-            "GHOSTINJECTOR",
-            "MEGADUMPER",
-            "SCYLLAHIDE",
-            "KIERO",
-            "RESHADE",
-            "NOHBOARD",
-            "AUTOHOTKEY", "AHK",
-            "AUTOCLICKER", "AUTO-CLICKER",
-            "MURGAA",
-            "IOBIT",
-            "RAZER SYNAPSE", "LOGITECH GHUB", "CORSAIR ICUE",
-            "VIRTUALBOX", "VMWARE", "VBOX",
-            "SANDBOXIE",
-            "HYPERV"
-        )
-
-        $cheatPrefetch = @()
-        foreach ($file in $files) {
-            foreach ($cheatName in $knownCheatNames) {
-                if ($file.Name.ToUpper() -like "*$cheatName*") {
-                    $cheatPrefetch += $file.Name
-                    break
-                }
-            }
-        }
-
-        if ($cheatPrefetch.Count -gt 0) {
-            Write-Host "`n  KNOWN CHEAT/SUSPICIOUS TOOL PREFETCH FOUND:" -ForegroundColor Red
-            foreach ($cf in $cheatPrefetch) {
-                Write-Host ("    {0}" -f $cf) -ForegroundColor Red
-            }
-        } else {
-            Write-Host "  Known cheat tool prefetch: None detected" -ForegroundColor Green
-        }
-
-        if ($suspiciousFiles.Count -gt 0) {
-            Write-Host "`n  SUSPICIOUS FILES FOUND: $($suspiciousFiles.Count)/$totalFiles" -ForegroundColor Yellow
-            foreach ($entry in $suspiciousFiles.GetEnumerator() | Sort-Object Key) {
-                Write-Host ("    {0} : {1}" -f $entry.Key, $entry.Value) -ForegroundColor White
-            }
-        } else {
-            Write-Host "`n  Prefetch integrity: Clean ($totalFiles files checked)" -ForegroundColor Green
-        }
-    }
-} else {
-    Write-Host "`nCouldnt find prefetch folder?? (check yo paths hoe)" -ForegroundColor Red
-}
-
-# ============================================================
-# RECYCLE BIN + CONSOLE HISTORY
-# ============================================================
+# PowerShell Script Block Logging
+Write-Host "`n  PowerShell Script Block Logging:" -ForegroundColor Cyan
 try {
-    $recycleBinPath = "$env:SystemDrive" + '\$Recycle.Bin'
-    Write-Host "`nRECYCLE BIN" -ForegroundColor Cyan
-
-    if (Test-Path $recycleBinPath) {
-        $recycleBinFolder = Get-Item -LiteralPath $recycleBinPath -Force
-        $userFolders = Get-ChildItem -LiteralPath $recycleBinPath -Directory -Force -ErrorAction SilentlyContinue
-
-        if ($userFolders) {
-            $allDeletedItems = @()
-            $latestModTime = $recycleBinFolder.LastWriteTime
-
-            foreach ($userFolder in $userFolders) {
-                if ($userFolder.LastWriteTime -gt $latestModTime) { $latestModTime = $userFolder.LastWriteTime }
-                $userItems = Get-ChildItem -LiteralPath $userFolder.FullName -File -Force -ErrorAction SilentlyContinue
-                if ($userItems) {
-                    $allDeletedItems += $userItems
-                    $latestFile = $userItems | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-                    if ($latestFile -and $latestFile.LastWriteTime -gt $latestModTime) { $latestModTime = $latestFile.LastWriteTime }
-                }
-            }
-
-            Write-Host "  Last Modified: " -NoNewline -ForegroundColor White
-            Write-Host $latestModTime.ToString("yyyy-MM-dd HH:mm:ss") -ForegroundColor Yellow
-
-            if ($allDeletedItems.Count -gt 0) {
-                Write-Host "  Total Items: " -NoNewline -ForegroundColor White
-                Write-Host $allDeletedItems.Count -ForegroundColor Yellow
-                $latestItem = $allDeletedItems | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-                Write-Host "  Latest Item: " -NoNewline -ForegroundColor White
-                Write-Host $latestItem.Name -ForegroundColor Gray
-            } else {
-                Write-Host "  Status: " -NoNewline -ForegroundColor White
-                Write-Host "Folders present but empty" -ForegroundColor Green
-            }
-        } else {
-            Write-Host "  Status: " -NoNewline -ForegroundColor White
-            Write-Host "Empty" -ForegroundColor Green
-            Write-Host "  Last Modified: " -NoNewline -ForegroundColor White
-            Write-Host $recycleBinFolder.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss") -ForegroundColor Green
-        }
-
-        $clearEvent = Get-WinEvent -FilterHashtable @{LogName="System"; Id=10006} -MaxEvents 1 -ErrorAction SilentlyContinue
-        if ($clearEvent) {
-            Write-Host "  Last Cleared (Event): " -NoNewline -ForegroundColor White
-            Write-Host $clearEvent.TimeCreated.ToString("yyyy-MM-dd HH:mm:ss") -ForegroundColor Red
-        }
-    } else {
-        Write-Host "  Recycle Bin not found at: $recycleBinPath" -ForegroundColor Yellow
-        Write-Host "  Note: Recycle Bin may be empty or on different drive" -ForegroundColor Gray
-    }
-
-    # Console history
-    $consoleHistoryPath = "$env:USERPROFILE\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadline\ConsoleHost_history.txt"
-    Write-Host "`n  CONSOLE HOST HISTORY" -ForegroundColor Cyan
-
-    if (Test-Path $consoleHistoryPath) {
-        $historyFile = Get-Item -Path $consoleHistoryPath -Force
-        Write-Host "    Last Modified: " -NoNewline -ForegroundColor White
-        Write-Host $historyFile.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss") -ForegroundColor Yellow
-
-        $attributes = $historyFile.Attributes
-        if ($attributes -ne "Archive") {
-            Write-Host "    Attributes: " -NoNewline -ForegroundColor White
-            Write-Host $attributes -ForegroundColor Yellow
-        } else {
-            Write-Host "    Attributes: Normal" -ForegroundColor Green
-        }
-
-        $fileSize = $historyFile.Length
-        Write-Host "    File Size: " -NoNewline -ForegroundColor White
-        Write-Host "$([math]::Round($fileSize/1024, 2)) KB" -ForegroundColor Yellow
-
-        # Scan history for suspicious commands
-        $historyContent = Get-Content -Path $consoleHistoryPath -ErrorAction SilentlyContinue
-        $suspiciousCommands = @("cheatengine","inject","dll","bypass","hook","patch","winhook","loadlibrary","virtualallocex","writeprocessmemory","createremotethread","mimikatz","invoke-expression","iex ","downloadstring","net user","whoami","bcdedit","vssadmin","wbadmin","cipher /w","sdelete","eraser","ccleaner","bleachbit")
-        $foundSuspicious = @()
-        foreach ($line in $historyContent) {
-            foreach ($cmd in $suspiciousCommands) {
-                if ($line -ilike "*$cmd*") {
-                    $foundSuspicious += $line.Trim()
+    $psblEvents = Get-WinEvent -LogName "Microsoft-Windows-PowerShell/Operational" `
+        -FilterXPath "*[System[EventID=4104]]" -MaxEvents 20 -ErrorAction SilentlyContinue
+    if ($psblEvents) {
+        Write-Host "    Script Block events found: $($psblEvents.Count)" -ForegroundColor Green
+        # Look for suspicious content
+        $suspiciousPS = @("IEX","Invoke-Expression","DownloadString","WebClient",
+                          "FromBase64","EncodedCommand","bypass","hidden","nop","Mimikatz",
+                          "Invoke-Mimikatz","AmsiBypass","reflection","assembly")
+        foreach ($ev in $psblEvents) {
+            foreach ($kw in $suspiciousPS) {
+                if ($ev.Message -ilike "*$kw*") {
+                    Write-Finding "Suspicious PowerShell SBL: contains '$kw' at $($ev.TimeCreated)" "High"
+                    Add-Finding "PowerShell" "Suspicious script block: $kw" "High" $ev.TimeCreated.ToString()
+                    Add-IOC "SuspiciousPowerShell" $kw $ev.TimeCreated.ToString()
                     break
                 }
             }
         }
-        if ($foundSuspicious.Count -gt 0) {
-            Write-Host "    Suspicious commands found in history:" -ForegroundColor Red
-            foreach ($sc in $foundSuspicious | Select-Object -Unique) {
-                Write-Host ("      > {0}" -f $sc) -ForegroundColor Red
-            }
-        } else {
-            Write-Host "    History content: No suspicious commands detected" -ForegroundColor Green
-        }
     } else {
-        Write-Host "    File not found: $consoleHistoryPath" -ForegroundColor Yellow
-        Write-Host "    Note: PowerShell history may be disabled or never used" -ForegroundColor Gray
+        Write-Finding "No PowerShell Script Block log events (logging may be disabled)" "Medium"
     }
-} catch {
-    Write-Host "  Error accessing system information: $($_.Exception.Message)" -ForegroundColor Red
+} catch { Write-Finding "Unable to read PowerShell operational log" "Low" }
+
+# Sysmon (if installed)
+Write-Host "`n  Sysmon Events:" -ForegroundColor Cyan
+try {
+    $sysmonLog = Get-WinEvent -ListLog "Microsoft-Windows-Sysmon/Operational" -ErrorAction SilentlyContinue
+    if ($sysmonLog) {
+        Write-Host "    Sysmon is INSTALLED - $($sysmonLog.RecordCount) events" -ForegroundColor Green
+        # Get recent process creation from Sysmon
+        $sysmonProc = Get-WinEvent -LogName "Microsoft-Windows-Sysmon/Operational" `
+            -FilterXPath "*[System[EventID=1]]" -MaxEvents 10 -ErrorAction SilentlyContinue
+        Write-Host "    Recent Sysmon process events: $($sysmonProc.Count)" -ForegroundColor White
+    } else {
+        Write-Finding "Sysmon not installed - reduced visibility" "Medium"
+    }
+} catch { Write-Finding "Sysmon not installed" "Medium" }
+
+# Service creation events
+Write-Host "`n  Service Creation (7045):" -ForegroundColor Cyan
+$svcCreate = Get-RecentEvents "System" @(7045) 10 "Service created"
+if ($svcCreate) {
+    foreach ($ev in $svcCreate) {
+        Write-Finding "New service created at $($ev.TimeCreated): $($ev.Message.Split("`n")[0])" "High"
+        Add-Finding "Services" "New service created" "High" $ev.TimeCreated.ToString()
+        Add-TimelineEvent $ev.TimeCreated "ServiceCreation" "New service installed"
+    }
+} else { Write-Host "    No recent service creation events" -ForegroundColor Green }
+
+# Driver loading
+Write-Host "`n  Driver Loading (6):" -ForegroundColor Cyan
+$driverLoad = Get-RecentEvents "System" @(6) 5 "Driver loaded"
+if ($driverLoad) {
+    foreach ($ev in $driverLoad) {
+        Write-Host "    Driver loaded: $($ev.TimeCreated) - $($ev.Message.Split("`n")[0])" -ForegroundColor Yellow
+        Add-TimelineEvent $ev.TimeCreated "DriverLoad" $ev.Message.Split("`n")[0]
+    }
 }
 
-# ============================================================
-# RUNNING PROCESSES - KNOWN CHEAT TOOLS
-# ============================================================
-Write-Host "`nRUNNING PROCESSES (CHEAT SCAN)" -ForegroundColor Cyan
+# System time change
+Write-Host "`n  System Time Changes (4616):" -ForegroundColor Cyan
+$timeChange = Get-RecentEvents "Security" @(4616) 5 "Time changed"
+if ($timeChange) {
+    foreach ($ev in $timeChange) {
+        Write-Finding "System time changed at $($ev.TimeCreated)" "High"
+        Add-Finding "AntiForensics" "System time modified" "High" $ev.TimeCreated.ToString()
+        Add-TimelineEvent $ev.TimeCreated "TimeChange" "System time modified"
+    }
+} else { Write-Host "    No time change events" -ForegroundColor Green }
 
+# WMI activity
+Write-Host "`n  WMI Activity:" -ForegroundColor Cyan
+try {
+    $wmiEvents = Get-WinEvent -LogName "Microsoft-Windows-WMI-Activity/Operational" `
+        -MaxEvents 10 -ErrorAction SilentlyContinue
+    if ($wmiEvents) {
+        Write-Host "    Recent WMI activity events: $($wmiEvents.Count)" -ForegroundColor Yellow
+        Add-Finding "WMI" "WMI activity detected" "Medium" "Review for persistence"
+    } else {
+        Write-Host "    No WMI activity events" -ForegroundColor Green
+    }
+} catch { Write-Finding "Unable to read WMI activity log" "Low" }
+
+# AppLocker
+Write-Host "`n  AppLocker Events:" -ForegroundColor Cyan
+try {
+    $alLogs = @("Microsoft-Windows-AppLocker/EXE and DLL",
+                "Microsoft-Windows-AppLocker/MSI and Script",
+                "Microsoft-Windows-AppLocker/Packaged app-Deployment")
+    foreach ($alLog in $alLogs) {
+        $alEvents = Get-WinEvent -LogName $alLog -MaxEvents 5 -ErrorAction SilentlyContinue
+        if ($alEvents) {
+            Write-Host "    $alLog`: $($alEvents.Count) events" -ForegroundColor Yellow
+        }
+    }
+} catch { Write-Finding "AppLocker not configured or unavailable" "Low" }
+
+# USB insert/remove
+Write-Host "`n  USB Device Events:" -ForegroundColor Cyan
+try {
+    $usbEvents = Get-WinEvent -LogName "Microsoft-Windows-DriverFrameworks-UserMode/Operational" `
+        -FilterXPath "*[System[EventID=2003 or EventID=2100]]" -MaxEvents 10 -ErrorAction SilentlyContinue
+    if ($usbEvents) {
+        foreach ($ev in $usbEvents) {
+            Write-Host ("    {0} ID:{1}" -f $ev.TimeCreated.ToString("MM/dd HH:mm"), $ev.Id) -ForegroundColor Yellow
+            Add-TimelineEvent $ev.TimeCreated "USB" "USB device event ID:$($ev.Id)"
+        }
+    } else { Write-Host "    No USB events in log" -ForegroundColor Green }
+} catch { Write-Finding "Unable to read USB events" "Low" }
+
+# Firewall log
+Write-Host "`n  Windows Firewall Events:" -ForegroundColor Cyan
+try {
+    $fwEvents = Get-WinEvent -LogName "Microsoft-Windows-Windows Firewall With Advanced Security/Firewall" `
+        -MaxEvents 5 -ErrorAction SilentlyContinue
+    if ($fwEvents) {
+        Write-Host "    Recent firewall events: $($fwEvents.Count)" -ForegroundColor White
+        $fwRuleChange = $fwEvents | Where-Object { $_.Id -in @(2004,2005,2006,2033) }
+        if ($fwRuleChange) {
+            Write-Finding "Firewall rule changes detected" "High"
+            Add-Finding "Firewall" "Firewall rules modified" "High" ""
+        }
+    }
+} catch { Write-Finding "Unable to read firewall events" "Low" }
+
+# Code Integrity
+Write-Host "`n  Code Integrity Events:" -ForegroundColor Cyan
+try {
+    $ciEvents = Get-WinEvent -LogName "Microsoft-Windows-CodeIntegrity/Operational" `
+        -FilterXPath "*[System[EventID=3001 or EventID=3002 or EventID=3004]]" `
+        -MaxEvents 5 -ErrorAction SilentlyContinue
+    if ($ciEvents) {
+        foreach ($ev in $ciEvents) {
+            Write-Finding "Code Integrity violation: $($ev.TimeCreated)" "High"
+            Add-Finding "CodeIntegrity" "Driver/binary blocked by CI" "High" $ev.TimeCreated.ToString()
+        }
+    } else { Write-Host "    No Code Integrity violations" -ForegroundColor Green }
+} catch { Write-Finding "Unable to read Code Integrity log" "Low" }
+
+# ============================================================
+# SECTION 7: PROCESS ANALYSIS - COMPREHENSIVE
+# ============================================================
+Write-SectionHeader "PROCESS ANALYSIS"
+
+Write-Host "  Collecting process details (this may take a moment)..." -ForegroundColor Gray
+
+$allProcs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
+$procTable = @{}
+foreach ($p in $allProcs) { $procTable[$p.ProcessId] = $p }
+
+# Suspicious parent/child relationships
+# e.g., Word spawning PowerShell, Explorer spawning cmd with odd args
+$suspiciousParentChild = @(
+    @{Parent="winword.exe";   Child="powershell.exe"; Desc="Word spawning PowerShell"},
+    @{Parent="winword.exe";   Child="cmd.exe";        Desc="Word spawning CMD"},
+    @{Parent="excel.exe";     Child="powershell.exe"; Desc="Excel spawning PowerShell"},
+    @{Parent="excel.exe";     Child="cmd.exe";        Desc="Excel spawning CMD"},
+    @{Parent="outlook.exe";   Child="powershell.exe"; Desc="Outlook spawning PowerShell"},
+    @{Parent="outlook.exe";   Child="cmd.exe";        Desc="Outlook spawning CMD"},
+    @{Parent="winword.exe";   Child="wscript.exe";    Desc="Word spawning WScript"},
+    @{Parent="excel.exe";     Child="wscript.exe";    Desc="Excel spawning WScript"},
+    @{Parent="explorer.exe";  Child="powershell.exe"; Desc="Explorer spawning PowerShell (review)"},
+    @{Parent="svchost.exe";   Child="powershell.exe"; Desc="Svchost spawning PowerShell"},
+    @{Parent="lsass.exe";     Child="*";              Desc="LSASS spawning child process - critical"},
+    @{Parent="services.exe";  Child="powershell.exe"; Desc="Services spawning PowerShell"}
+)
+
+Write-Host "`n  Suspicious Parent/Child Process Relationships:" -ForegroundColor Cyan
+$foundSuspiciousPC = $false
+
+foreach ($proc in $allProcs) {
+    if ($proc.ParentProcessId -and $procTable.ContainsKey($proc.ParentProcessId)) {
+        $parent = $procTable[$proc.ParentProcessId]
+        $parentName = $parent.Name.ToLower()
+        $childName  = $proc.Name.ToLower()
+
+        foreach ($rule in $suspiciousParentChild) {
+            $parentMatch = $parentName -like $rule.Parent.ToLower()
+            $childMatch  = $childName  -like $rule.Child.ToLower()
+            if ($parentMatch -and $childMatch) {
+                Write-Finding "$($rule.Desc): PID $($proc.ProcessId) ($($proc.Name)) parent PID $($proc.ParentProcessId) ($($parent.Name))" "High"
+                Add-Finding "ProcessAnalysis" $rule.Desc "High" "PID:$($proc.ProcessId) Parent:$($proc.ParentProcessId)"
+                $foundSuspiciousPC = $true
+                break
+            }
+        }
+    }
+}
+if (-not $foundSuspiciousPC) { Write-Host "    No suspicious parent/child relationships detected" -ForegroundColor Green }
+
+# Processes running from suspicious locations
+Write-Host "`n  Processes Running from Suspicious Locations:" -ForegroundColor Cyan
+$suspiciousLocations = @(
+    "*\Temp\*", "*\AppData\Local\Temp\*", "*\AppData\Roaming\*",
+    "*\Downloads\*", "*\Public\*", "*\Users\Public\*",
+    "*\ProgramData\*"
+)
+
+$suspiciousLocationProcs = @()
+foreach ($proc in $allProcs) {
+    if ($proc.ExecutablePath) {
+        foreach ($loc in $suspiciousLocations) {
+            if ($proc.ExecutablePath -like $loc) {
+                $suspiciousLocationProcs += $proc
+                break
+            }
+        }
+    }
+}
+
+if ($suspiciousLocationProcs.Count -gt 0) {
+    foreach ($p in $suspiciousLocationProcs) {
+        Write-Finding "Process from suspicious path: $($p.Name) PID:$($p.ProcessId) Path:$($p.ExecutablePath)" "High"
+        Add-Finding "ProcessAnalysis" "Process from suspicious location" "High" $p.ExecutablePath
+        Add-IOC "SuspiciousProcess" $p.ExecutablePath "Running from user-writable location"
+    }
+} else { Write-Host "    No processes from suspicious locations" -ForegroundColor Green }
+
+# Unsigned processes
+Write-Host "`n  Unsigned Process Binaries:" -ForegroundColor Cyan
+$unsignedProcs = @()
+$checkedPaths  = @{}
+
+foreach ($proc in $allProcs) {
+    if ($proc.ExecutablePath -and -not $checkedPaths.ContainsKey($proc.ExecutablePath)) {
+        $checkedPaths[$proc.ExecutablePath] = $true
+        $sig = Get-AuthenticodeSignature -FilePath $proc.ExecutablePath -ErrorAction SilentlyContinue
+        if ($sig -and $sig.Status -ne "Valid") {
+            $unsignedProcs += [PSCustomObject]@{
+                Name   = $proc.Name
+                PID    = $proc.ProcessId
+                Path   = $proc.ExecutablePath
+                Status = $sig.Status
+            }
+        }
+    }
+}
+
+if ($unsignedProcs.Count -gt 0) {
+    foreach ($up in $unsignedProcs | Select-Object -First 20) {
+        Write-Finding "Unsigned binary: $($up.Name) PID:$($up.PID) [$($up.Status)] $($up.Path)" "Medium"
+        Add-Finding "ProcessAnalysis" "Unsigned binary running" "Medium" $up.Path
+    }
+} else { Write-Host "    All checked process binaries are signed" -ForegroundColor Green }
+
+# Full process list with details
+Write-Host "`n  Full Process List with Details:" -ForegroundColor Cyan
+Write-Host ("  {0,-25} {1,-8} {2,-8} {3,-20} {4}" -f "Name","PID","PPID","User","Path") -ForegroundColor DarkGray
+
+foreach ($proc in $allProcs | Sort-Object Name) {
+    $owner = $proc.GetOwner()
+    $user  = if ($owner.User) { "$($owner.Domain)\$($owner.User)" } else { "SYSTEM" }
+
+    # SHA256 hash for running executables
+    $hash = ""
+    if ($proc.ExecutablePath -and (Test-Path $proc.ExecutablePath -ErrorAction SilentlyContinue)) {
+        $h = Get-FileHash $proc.ExecutablePath -Algorithm SHA256 -ErrorAction SilentlyContinue
+        if ($h) { $hash = $h.Hash.Substring(0,16) + "..." }
+    }
+
+    $color = "White"
+    # Flag known suspicious process names
+    $suspNames = @("cheatengine","xenos","processhacker","x64dbg","x32dbg","ollydbg",
+                   "mimikatz","meterpreter","nc","ncat","netcat","psexec")
+    foreach ($sn in $suspNames) {
+        if ($proc.Name -ilike "*$sn*") { $color = "Red"; break }
+    }
+
+    Write-Host ("  {0,-25} {1,-8} {2,-8} {3,-20} {4}" -f
+        $proc.Name.Substring(0,[Math]::Min(24,$proc.Name.Length)),
+        $proc.ProcessId,
+        $proc.ParentProcessId,
+        $user.Substring(0,[Math]::Min(19,$user.Length)),
+        $(if ($proc.ExecutablePath) { $proc.ExecutablePath } else { "[No Path]" })
+    ) -ForegroundColor $color
+}
+
+# Known cheat/tool process scan
+Write-Host "`n  Known Cheat/Suspicious Tool Processes:" -ForegroundColor Cyan
 $suspiciousProcessNames = @(
     "cheatengine","cheatengine-x86_64","cheatengine-i386",
-    "xenos","xenoinjector",
+    "xenos","xenoinjector","extremeinjector","ghostinjector",
     "processhacker","processhacker2",
     "x64dbg","x32dbg","ollydbg","windbg","immunitydebugger",
-    "reclass","reclass64",
-    "artmoney",
+    "reclass","reclass64","artmoney",
     "wireshark","rawcap","fiddler","charles",
-    "extremeinjector","ghostinjector",
-    "megadumper",
-    "scyllaHide",
-    "autohotkey","ahk2exe",
-    "autoclicker",
-    "sandboxie","sbie",
-    "vmware","virtualbox","vboxservice","vmtoolsd",
-    "reshade",
-    "nohboard",
-    "iocheatclient",
-    "unknowncheats"
+    "megadumper","autohotkey","ahk2exe","autoclicker",
+    "sandboxie","sbie","vmware","virtualbox","vboxservice","vmtoolsd",
+    "reshade","nohboard"
 )
 
 $runningProcs = Get-Process -ErrorAction SilentlyContinue
-$foundProcs = @()
-
+$foundProcs   = @()
 foreach ($proc in $runningProcs) {
     foreach ($sus in $suspiciousProcessNames) {
-        if ($proc.Name -ilike "*$sus*") {
-            $foundProcs += $proc
-            break
-        }
+        if ($proc.Name -ilike "*$sus*") { $foundProcs += $proc; break }
     }
 }
 
 if ($foundProcs.Count -gt 0) {
-    Write-Host "  SUSPICIOUS PROCESSES DETECTED:" -ForegroundColor Red
     foreach ($p in $foundProcs) {
-        Write-Host ("    PID: {0,-8} Name: {1}" -f $p.Id, $p.Name) -ForegroundColor Red
+        Write-Finding "Suspicious process: $($p.Name) PID:$($p.Id)" "High"
+        Add-Finding "ProcessAnalysis" "Known suspicious tool running: $($p.Name)" "High" "PID:$($p.Id)"
+        Add-IOC "SuspiciousProcess" $p.Name "Known tool process running"
     }
-} else {
-    Write-Host "  No known cheat tool processes running" -ForegroundColor Green
-}
+} else { Write-Host "    No known suspicious tool processes detected" -ForegroundColor Green }
 
 # ============================================================
-# INSTALLED PROGRAMS - KNOWN CHEAT TOOLS
+# SECTION 8: PERSISTENCE - COMPREHENSIVE
 # ============================================================
-Write-Host "`nINSTALLED PROGRAMS (CHEAT SCAN)" -ForegroundColor Cyan
+Write-SectionHeader "PERSISTENCE MECHANISMS"
 
-$regPaths = @(
-    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
-    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
-    "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
-)
-
-$suspiciousSoftware = @(
-    "cheat engine","artmoney","processhacker","wireshark","fiddler",
-    "x64dbg","x32dbg","ollydbg","extremeinjector",
-    "autohotkey","sandboxie","reshade","nohboard",
-    "vmware","virtualbox","cheatengine"
-)
-
-$installedPrograms = foreach ($path in $regPaths) {
-    Get-ItemProperty $path -ErrorAction SilentlyContinue |
-        Select-Object DisplayName, DisplayVersion, InstallDate
-}
-
-$foundSoftware = @()
-foreach ($prog in $installedPrograms) {
-    if ($prog.DisplayName) {
-        foreach ($sus in $suspiciousSoftware) {
-            if ($prog.DisplayName -ilike "*$sus*") {
-                $foundSoftware += $prog
-                break
-            }
-        }
-    }
-}
-
-if ($foundSoftware.Count -gt 0) {
-    Write-Host "  SUSPICIOUS SOFTWARE INSTALLED:" -ForegroundColor Red
-    foreach ($sw in $foundSoftware) {
-        Write-Host ("    {0} (v{1}) installed: {2}" -f $sw.DisplayName, $sw.DisplayVersion, $sw.InstallDate) -ForegroundColor Red
-    }
-} else {
-    Write-Host "  No known cheat tools found in installed programs" -ForegroundColor Green
-}
-
-# ============================================================
-# RECENTLY MODIFIED FILES IN TEMP / APPDATA
-# ============================================================
-Write-Host "`nRECENT SUSPICIOUS FILES (TEMP / APPDATA)" -ForegroundColor Cyan
-
-$scanPaths = @(
-    "$env:TEMP",
-    "$env:LOCALAPPDATA\Temp",
-    "$env:APPDATA"
-)
-
-$suspiciousExtensions = @(".dll",".exe",".bat",".vbs",".ps1",".cmd",".ahk",".sys")
-$cutoffTime = (Get-Date).AddHours(-24)
-$recentSuspicious = @()
-
-foreach ($scanPath in $scanPaths) {
-    if (Test-Path $scanPath) {
-        $recentFiles = Get-ChildItem -Path $scanPath -File -Recurse -Force -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.LastWriteTime -gt $cutoffTime -and
-                $suspiciousExtensions -contains $_.Extension.ToLower()
-            } | Select-Object -First 20
-        $recentSuspicious += $recentFiles
-    }
-}
-
-if ($recentSuspicious.Count -gt 0) {
-    Write-Host "  Files modified in last 24h with suspicious extensions:" -ForegroundColor Yellow
-    foreach ($rf in $recentSuspicious | Sort-Object LastWriteTime -Descending | Select-Object -First 15) {
-        Write-Host ("    [{0}] {1}" -f $rf.LastWriteTime.ToString("HH:mm:ss"), $rf.FullName) -ForegroundColor Yellow
-    }
-} else {
-    Write-Host "  No suspicious recently modified files found" -ForegroundColor Green
-}
-
-# ============================================================
-# DRIVERS - UNSIGNED / SUSPICIOUS
-# ============================================================
-Write-Host "`nDRIVER CHECK" -ForegroundColor Cyan
-
-try {
-    $drivers = Get-CimInstance Win32_SystemDriver -ErrorAction SilentlyContinue |
-        Where-Object { $_.State -eq "Running" }
-
-    $suspiciousDriverNames = @(
-        "kdmapper","kdu","kdudrv","capcom","dbk64","dbk32",
-        "mimidrv","procexp","procexp152","procmon",
-        "vmci","vmmouse","vmhgfs",
-        "vboxdrv","vboxnetadp","vboxnetflt","vboxusb",
-        "cheatenginedriver","cedriver"
-    )
-
-    $flaggedDrivers = @()
-    foreach ($drv in $drivers) {
-        foreach ($sus in $suspiciousDriverNames) {
-            if ($drv.Name -ilike "*$sus*") {
-                $flaggedDrivers += $drv
-                break
-            }
-        }
-    }
-
-    if ($flaggedDrivers.Count -gt 0) {
-        Write-Host "  SUSPICIOUS DRIVERS FOUND:" -ForegroundColor Red
-        foreach ($d in $flaggedDrivers) {
-            Write-Host ("    {0} - {1}" -f $d.Name, $d.PathName) -ForegroundColor Red
-        }
-    } else {
-        Write-Host "  No known suspicious drivers detected" -ForegroundColor Green
-    }
-
-    # Check total running driver count (unusually high = suspicious)
-    Write-Host ("  Total running drivers: {0}" -f $drivers.Count) -ForegroundColor White
-
-} catch {
-    Write-Host "  Unable to enumerate drivers: $($_.Exception.Message)" -ForegroundColor Red
-}
-
-# ============================================================
-# NETWORK CONNECTIONS - SUSPICIOUS PORTS / CONNECTIONS
-# ============================================================
-Write-Host "`nNETWORK CONNECTIONS (SUSPICIOUS)" -ForegroundColor Cyan
-
-try {
-    $netConnections = Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue
-
-    # Common cheat/bypass related ports or loopback oddities
-    $suspiciousPorts = @(1337, 4444, 5555, 6666, 7777, 8888, 9999, 31337, 12345, 54321)
-
-    $flaggedConnections = $netConnections | Where-Object {
-        $suspiciousPorts -contains $_.RemotePort -or
-        $suspiciousPorts -contains $_.LocalPort
-    }
-
-    if ($flaggedConnections) {
-        Write-Host "  SUSPICIOUS PORT CONNECTIONS:" -ForegroundColor Red
-        foreach ($conn in $flaggedConnections) {
-            $proc = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
-            Write-Host ("    {0}:{1} -> {2}:{3} | PID: {4} ({5})" -f
-                $conn.LocalAddress, $conn.LocalPort,
-                $conn.RemoteAddress, $conn.RemotePort,
-                $conn.OwningProcess,
-                $(if ($proc) { $proc.Name } else { "Unknown" })) -ForegroundColor Red
-        }
-    } else {
-        Write-Host "  No connections on known suspicious ports" -ForegroundColor Green
-    }
-
-    # Check for unusual number of established connections
-    if ($netConnections.Count -gt 50) {
-        Write-Host ("  WARNING: High number of established connections ({0})" -f $netConnections.Count) -ForegroundColor Yellow
-    } else {
-        Write-Host ("  Active connections: {0}" -f $netConnections.Count) -ForegroundColor Green
-    }
-
-} catch {
-    Write-Host "  Unable to enumerate network connections: $($_.Exception.Message)" -ForegroundColor Red
-}
-
-# ============================================================
-# STARTUP ENTRIES
-# ============================================================
-Write-Host "`nSTARTUP ENTRIES" -ForegroundColor Cyan
-
-$startupPaths = @(
+# Run Keys
+Write-Host "  Autorun Registry Keys:" -ForegroundColor Cyan
+$runKeys = @(
     "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
     "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce",
+    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run",
     "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
-    "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"
+    "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce",
+    "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon",
+    "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\BootExecute"
 )
 
-$suspiciousStartupKeywords = @(
-    "cheat","inject","hack","bypass","loader","trainer",
-    "autohotkey","ahk","xenos","processhacker","artmoney",
-    "keygen","crack","patch","unlocker"
-)
+$suspiciousRunKeywords = @("cheat","inject","hack","bypass","loader","trainer",
+    "autohotkey","ahk","xenos","processhacker","artmoney","keygen",
+    "crack","patch","unlocker","temp","appdata","public")
 
-$flaggedStartup = @()
-
-foreach ($sp in $startupPaths) {
-    $entries = Get-ItemProperty -Path $sp -ErrorAction SilentlyContinue
+foreach ($rk in $runKeys) {
+    $entries = Get-ItemProperty -Path $rk -ErrorAction SilentlyContinue
     if ($entries) {
         $entries.PSObject.Properties | Where-Object { $_.Name -notlike "PS*" } | ForEach-Object {
-            foreach ($kw in $suspiciousStartupKeywords) {
-                if ($_.Name -ilike "*$kw*" -or $_.Value -ilike "*$kw*") {
-                    $flaggedStartup += [PSCustomObject]@{ Path = $sp; Name = $_.Name; Value = $_.Value }
-                    break
+            $isSuspicious = $false
+            foreach ($kw in $suspiciousRunKeywords) {
+                if ($_.Name -ilike "*$kw*" -or ($_.Value -is [string] -and $_.Value -ilike "*$kw*")) {
+                    $isSuspicious = $true; break
                 }
+            }
+            if ($isSuspicious) {
+                Write-Finding "SUSPICIOUS Run key: [$($rk)] $($_.Name) = $($_.Value)" "High"
+                Add-Finding "Persistence" "Suspicious Run key" "High" "$($_.Name)=$($_.Value)"
+                Add-IOC "Persistence" "$rk\$($_.Name)" $_.Value
+            } else {
+                Write-Host ("    [{0}] {1} = {2}" -f
+                    ($rk -replace "HKLM:\\|HKCU:\\",""),
+                    $_.Name,
+                    $(if ($_.Value -is [string]) { $_.Value.Substring(0,[Math]::Min(60,$_.Value.Length)) } else { $_.Value })
+                ) -ForegroundColor White
             }
         }
     }
 }
 
-if ($flaggedStartup.Count -gt 0) {
-    Write-Host "  SUSPICIOUS STARTUP ENTRIES:" -ForegroundColor Red
-    foreach ($entry in $flaggedStartup) {
-        Write-Host ("    [{0}] {1} = {2}" -f $entry.Path, $entry.Name, $entry.Value) -ForegroundColor Red
-    }
-} else {
-    Write-Host "  No suspicious startup entries found" -ForegroundColor Green
-}
+# Winlogon hijack check
+Write-Host "`n  Winlogon Integrity:" -ForegroundColor Cyan
+try {
+    $winlogon = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" -ErrorAction SilentlyContinue
+    $expectedUseInit = "userinit.exe,"
+    $expectedShell   = "explorer.exe"
 
-# ============================================================
-# SCHEDULED TASKS - SUSPICIOUS
-# ============================================================
-Write-Host "`nSCHEDULED TASKS (SUSPICIOUS)" -ForegroundColor Cyan
+    if ($winlogon.Userinit -ne $expectedUseInit) {
+        Write-Finding "Winlogon Userinit modified: $($winlogon.Userinit)" "Critical"
+        Add-Finding "Persistence" "Winlogon Userinit hijacked" "Critical" $winlogon.Userinit
+        Add-IOC "Persistence" "Winlogon\Userinit" $winlogon.Userinit
+    } else { Write-Host "    Userinit: OK ($($winlogon.Userinit))" -ForegroundColor Green }
 
+    if ($winlogon.Shell -ne $expectedShell) {
+        Write-Finding "Winlogon Shell modified: $($winlogon.Shell)" "Critical"
+        Add-Finding "Persistence" "Winlogon Shell hijacked" "Critical" $winlogon.Shell
+        Add-IOC "Persistence" "Winlogon\Shell" $winlogon.Shell
+    } else { Write-Host "    Shell: OK ($($winlogon.Shell))" -ForegroundColor Green }
+} catch { Write-Finding "Unable to check Winlogon" "Low" }
+
+# Scheduled Tasks
+Write-Host "`n  Scheduled Tasks:" -ForegroundColor Cyan
 try {
     $tasks = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.State -ne "Disabled" }
-    $suspiciousTaskKeywords = @(
-        "cheat","inject","hack","bypass","loader","trainer",
-        "autohotkey","ahk","xenos","artmoney","keygen","crack","patch"
-    )
+    Write-Host "    Total enabled tasks: $($tasks.Count)" -ForegroundColor White
 
-    $flaggedTasks = @()
+    $suspTaskKeywords = @("cheat","inject","hack","bypass","loader","trainer",
+        "autohotkey","ahk","xenos","artmoney","keygen","crack","patch")
+
     foreach ($task in $tasks) {
-        foreach ($kw in $suspiciousTaskKeywords) {
-            if ($task.TaskName -ilike "*$kw*" -or $task.TaskPath -ilike "*$kw*") {
-                $flaggedTasks += $task
-                break
+        # Check task name
+        $nameFlag = $false
+        foreach ($kw in $suspTaskKeywords) {
+            if ($task.TaskName -ilike "*$kw*") { $nameFlag = $true; break }
+        }
+
+        # Check task action
+        $actionFlag = $false
+        $taskAction = ($task.Actions | ForEach-Object { $_.Execute + " " + $_.Arguments }) -join " "
+        foreach ($kw in @("powershell","cmd","wscript","cscript","mshta","rundll32","regsvr32") + $suspTaskKeywords) {
+            if ($taskAction -ilike "*$kw*") { $actionFlag = $true; break }
+        }
+
+        # Check for tasks in non-standard paths
+        $pathFlag = $task.TaskPath -ne "\" -and $task.TaskPath -notlike "\Microsoft\*"
+
+        if ($nameFlag) {
+            Write-Finding "Suspicious task name: $($task.TaskPath)$($task.TaskName)" "High"
+            Add-Finding "Persistence" "Suspicious scheduled task" "High" $task.TaskName
+            Add-IOC "Persistence" "ScheduledTask" $task.TaskName
+        } elseif ($pathFlag -and $actionFlag) {
+            Write-Finding "Non-standard task with script action: $($task.TaskPath)$($task.TaskName)" "Medium"
+            Add-Finding "Persistence" "Non-standard scheduled task" "Medium" $task.TaskName
+        }
+
+        # Show recently created tasks
+        $taskInfo = Get-ScheduledTaskInfo -TaskName $task.TaskName -TaskPath $task.TaskPath -ErrorAction SilentlyContinue
+        if ($taskInfo -and $taskInfo.TaskToRunAt) {
+            # Show all non-Microsoft tasks
+            if ($task.TaskPath -notlike "\Microsoft\*") {
+                Write-Host ("    {0}{1}  Action: {2}" -f
+                    $task.TaskPath, $task.TaskName,
+                    $taskAction.Substring(0,[Math]::Min(60,$taskAction.Length))) -ForegroundColor White
             }
         }
     }
+} catch { Write-Finding "Unable to enumerate scheduled tasks: $($_.Exception.Message)" "Medium" }
 
-    if ($flaggedTasks.Count -gt 0) {
-        Write-Host "  SUSPICIOUS SCHEDULED TASKS:" -ForegroundColor Red
-        foreach ($t in $flaggedTasks) {
-            Write-Host ("    {0}{1}" -f $t.TaskPath, $t.TaskName) -ForegroundColor Red
-        }
-    } else {
-        Write-Host "  No suspicious scheduled tasks found" -ForegroundColor Green
-    }
-} catch {
-    Write-Host "  Unable to enumerate scheduled tasks: $($_.Exception.Message)" -ForegroundColor Red
-}
-
-# ============================================================
-# VIRTUAL MACHINE / SANDBOX DETECTION
-# ============================================================
-Write-Host "`nVIRTUAL MACHINE / SANDBOX CHECK" -ForegroundColor Cyan
-
+# Services
+Write-Host "`n  Services (Non-Microsoft):" -ForegroundColor Cyan
 try {
-    $computerSystem = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
-    $biosInfo = Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue
+    $allSvcs = Get-CimInstance Win32_Service -ErrorAction SilentlyContinue |
+        Where-Object { $_.PathName -notlike "*System32*" -and $_.PathName -notlike "*SysWOW64*" }
 
-    $vmIndicators = @("VMware","VirtualBox","VBOX","Virtual","Hyper-V","QEMU","KVM","Xen","Parallels","innotek")
-    $isVM = $false
+    foreach ($svc in $allSvcs | Sort-Object Name) {
+        $sig = Get-AuthenticodeSignature -FilePath ($svc.PathName -replace '"','').Split(" ")[0] -ErrorAction SilentlyContinue
+        $isSigned = $sig -and $sig.Status -eq "Valid"
+        $color    = if ($isSigned) { "White" } else { "Yellow" }
 
-    foreach ($indicator in $vmIndicators) {
-        if ($computerSystem.Manufacturer -ilike "*$indicator*" -or
-            $computerSystem.Model -ilike "*$indicator*" -or
-            $biosInfo.Manufacturer -ilike "*$indicator*" -or
-            $biosInfo.Version -ilike "*$indicator*") {
-            $isVM = $true
-            Write-Host ("  VM DETECTED: {0} {1}" -f $computerSystem.Manufacturer, $computerSystem.Model) -ForegroundColor Red
-            break
+        Write-Host ("    {0,-25} {1,-10} {2}" -f
+            $svc.Name.Substring(0,[Math]::Min(24,$svc.Name.Length)),
+            $svc.State,
+            $svc.PathName.Substring(0,[Math]::Min(60,$svc.PathName.Length))) -ForegroundColor $color
+
+        if (-not $isSigned -and $svc.State -eq "Running") {
+            Add-Finding "Services" "Unsigned non-system service running" "Medium" $svc.PathName
         }
     }
+} catch { Write-Finding "Unable to enumerate services" "Medium" }
 
-    if (-not $isVM) {
-        Write-Host ("  System: {0} {1}" -f $computerSystem.Manufacturer, $computerSystem.Model) -ForegroundColor Green
-        Write-Host "  No VM indicators detected" -ForegroundColor Green
-    }
-} catch {
-    Write-Host "  Unable to check VM status: $($_.Exception.Message)" -ForegroundColor Red
-}
-
-# ============================================================
-# BAM (BACKGROUND ACTIVITY MODERATOR) - RECENT EXECUTIONS
-# ============================================================
-Write-Host "`nBAM - RECENT PROGRAM EXECUTIONS" -ForegroundColor Cyan
-
+# WMI Persistence
+Write-Host "`n  WMI Persistence:" -ForegroundColor Cyan
 try {
-    $bamPaths = @(
-        "HKLM:\SYSTEM\CurrentControlSet\Services\bam\State\UserSettings",
-        "HKLM:\SYSTEM\CurrentControlSet\Services\bam\UserSettings"
+    $wmiFilters   = Get-CimInstance -Namespace "root\subscription" -ClassName __EventFilter -ErrorAction SilentlyContinue
+    $wmiConsumers = Get-CimInstance -Namespace "root\subscription" -ClassName __EventConsumer -ErrorAction SilentlyContinue
+    $wmiBindings  = Get-CimInstance -Namespace "root\subscription" -ClassName __FilterToConsumerBinding -ErrorAction SilentlyContinue
+
+    $legitimateFilters = @("SCM Event Log Filter")
+
+    if ($wmiFilters) {
+        foreach ($f in $wmiFilters) {
+            if ($f.Name -notin $legitimateFilters) {
+                Write-Finding "WMI Event Filter: $($f.Name) Query: $($f.Query)" "Critical"
+                Add-Finding "Persistence" "WMI Event Filter" "Critical" $f.Name
+                Add-IOC "WMIPersistence" $f.Name $f.Query
+            }
+        }
+    } else { Write-Host "    No WMI event filters" -ForegroundColor Green }
+
+    if ($wmiConsumers) {
+        foreach ($c in $wmiConsumers) {
+            Write-Finding "WMI Consumer: $($c.Name)" "Critical"
+            Add-Finding "Persistence" "WMI Event Consumer" "Critical" $c.Name
+            Add-IOC "WMIPersistence" "Consumer" $c.Name
+        }
+    } else { Write-Host "    No WMI event consumers" -ForegroundColor Green }
+
+    if ($wmiBindings) {
+        Write-Finding "WMI bindings present: $($wmiBindings.Count)" "Critical"
+    } else { Write-Host "    No WMI bindings" -ForegroundColor Green }
+
+} catch { Write-Finding "Unable to query WMI subscriptions" "Medium" }
+
+# COM Hijacking - Check HKCU CLSID overrides
+Write-Host "`n  COM Hijacking (HKCU CLSID overrides):" -ForegroundColor Cyan
+try {
+    $hkcuCLSIDs = Get-ChildItem "HKCU:\Software\Classes\CLSID" -ErrorAction SilentlyContinue
+    if ($hkcuCLSIDs -and $hkcuCLSIDs.Count -gt 0) {
+        Write-Finding "HKCU CLSID overrides found: $($hkcuCLSIDs.Count) - potential COM hijacking" "High"
+        foreach ($clsid in $hkcuCLSIDs | Select-Object -First 10) {
+            Write-Host ("    {0}" -f $clsid.PSChildName) -ForegroundColor Yellow
+            Add-Finding "Persistence" "COM CLSID override in HKCU" "High" $clsid.PSChildName
+            Add-IOC "COMHijack" $clsid.PSChildName "HKCU CLSID override"
+        }
+    } else { Write-Host "    No HKCU CLSID overrides" -ForegroundColor Green }
+} catch { Write-Finding "Unable to check COM hijacking" "Low" }
+
+# AppInit DLLs
+Write-Host "`n  AppInit_DLLs:" -ForegroundColor Cyan
+try {
+    $appInitPaths = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Windows"
     )
-
-    $bamFound = $false
-    foreach ($bamPath in $bamPaths) {
-        if (Test-Path $bamPath) {
-            $userKeys = Get-ChildItem -Path $bamPath -ErrorAction SilentlyContinue
-            foreach ($userKey in $userKeys) {
-                $entries = Get-ItemProperty -Path $userKey.PSPath -ErrorAction SilentlyContinue
-                if ($entries) {
-                    $bamFound = $true
-                    $entries.PSObject.Properties |
-                        Where-Object { $_.Name -like "*\*" -and $_.Name -notlike "PS*" } |
-                        ForEach-Object {
-                            $exePath = $_.Name
-                            # Check against suspicious names
-                            foreach ($sus in $suspiciousProcessNames) {
-                                if ($exePath -ilike "*$sus*") {
-                                    Write-Host ("  SUSPICIOUS BAM ENTRY: {0}" -f $exePath) -ForegroundColor Red
-                                }
-                            }
-                        }
-                }
-            }
-        }
+    foreach ($aip in $appInitPaths) {
+        $ai = Get-ItemProperty $aip -Name AppInit_DLLs -ErrorAction SilentlyContinue
+        if ($ai -and $ai.AppInit_DLLs -ne "") {
+            Write-Finding "AppInit_DLLs set: $($ai.AppInit_DLLs) in $aip" "Critical"
+            Add-Finding "Persistence" "AppInit_DLLs configured" "Critical" $ai.AppInit_DLLs
+            Add-IOC "Persistence" "AppInit_DLLs" $ai.AppInit_DLLs
+        } else { Write-Host "    $aip`: Clean" -ForegroundColor Green }
     }
+} catch { Write-Finding "Unable to check AppInit_DLLs" "Low" }
 
-    if (-not $bamFound) {
-        Write-Host "  BAM registry path not found or empty" -ForegroundColor Yellow
-    } else {
-        Write-Host "  BAM entries scanned for suspicious executables" -ForegroundColor Green
-    }
-} catch {
-    Write-Host "  Unable to read BAM registry: $($_.Exception.Message)" -ForegroundColor Red
-}
-
-# ============================================================
-# WINDOWS DEFENDER - STATUS CHECK
-# ============================================================
-Write-Host "`nWINDOWS DEFENDER STATUS" -ForegroundColor Cyan
-
-try {
-    $defenderStatus = Get-MpComputerStatus -ErrorAction SilentlyContinue
-    if ($defenderStatus) {
-        $rtEnabled = $defenderStatus.RealTimeProtectionEnabled
-        $amEnabled = $defenderStatus.AntivirusEnabled
-        $tamperProtection = $defenderStatus.IsTamperProtected
-
-        Write-Host ("  Real-Time Protection: {0}" -f $(if ($rtEnabled) { "Enabled" } else { "DISABLED" })) -ForegroundColor $(if ($rtEnabled) { "Green" } else { "Red" })
-        Write-Host ("  Antivirus Enabled:    {0}" -f $(if ($amEnabled) { "Enabled" } else { "DISABLED" })) -ForegroundColor $(if ($amEnabled) { "Green" } else { "Red" })
-        Write-Host ("  Tamper Protection:    {0}" -f $(if ($tamperProtection) { "Enabled" } else { "DISABLED" })) -ForegroundColor $(if ($tamperProtection) { "Green" } else { "Red" })
-    } else {
-        Write-Host "  Unable to retrieve Defender status" -ForegroundColor Yellow
-    }
-} catch {
-    Write-Host "  Error retrieving Defender status: $($_.Exception.Message)" -ForegroundColor Red
-}
-
-# ============================================================
-# CLIPBOARD CONTENTS CHECK
-# ============================================================
-Write-Host "`nCLIPBOARD CHECK" -ForegroundColor Cyan
-
-try {
-    Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
-    $clipboard = [System.Windows.Forms.Clipboard]::GetText()
-    if ($clipboard -and $clipboard.Length -gt 0) {
-        $suspiciousClipKeywords = @("inject","cheat","hack","bypass","dll","loadlibrary","crack","keygen","serial","license")
-        $clipSuspicious = $false
-        foreach ($kw in $suspiciousClipKeywords) {
-            if ($clipboard -ilike "*$kw*") {
-                $clipSuspicious = $true
-                break
-            }
-        }
-        if ($clipSuspicious) {
-            Write-Host "  WARNING: Clipboard contains suspicious content" -ForegroundColor Red
-            Write-Host ("  Preview: {0}" -f $clipboard.Substring(0, [Math]::Min(100, $clipboard.Length))) -ForegroundColor Yellow
-        } else {
-            Write-Host "  Clipboard: Content present but nothing suspicious" -ForegroundColor Green
-        }
-    } else {
-        Write-Host "  Clipboard: Empty" -ForegroundColor Green
-    }
-} catch {
-    Write-Host "  Unable to read clipboard: $($_.Exception.Message)" -ForegroundColor Yellow
-}
-
-# ============================================================
-# SYSTEM FILE INTEGRITY - KEY WINDOWS FILES
-# ============================================================
-Write-Host "`nSYSTEM FILE INTEGRITY CHECK" -ForegroundColor Cyan
-
-$keyFiles = @(
-    "$env:SystemRoot\System32\ntdll.dll",
-    "$env:SystemRoot\System32\kernel32.dll",
-    "$env:SystemRoot\System32\kernelbase.dll",
-    "$env:SystemRoot\System32\user32.dll",
-    "$env:SystemRoot\System32\wininet.dll"
+# Startup folders
+Write-Host "`n  Startup Folders:" -ForegroundColor Cyan
+$startupFolders = @(
+    "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup",
+    "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp"
 )
-
-foreach ($kf in $keyFiles) {
-    if (Test-Path $kf) {
-        $sig = Get-AuthenticodeSignature -FilePath $kf -ErrorAction SilentlyContinue
-        if ($sig.Status -eq "Valid") {
-            Write-Host ("  {0,-30} Signature: Valid" -f (Split-Path $kf -Leaf)) -ForegroundColor Green
-        } else {
-            Write-Host ("  {0,-30} Signature: {1} !! POSSIBLE HOOK/PATCH !!" -f (Split-Path $kf -Leaf), $sig.Status) -ForegroundColor Red
-        }
-    } else {
-        Write-Host ("  {0,-30} NOT FOUND" -f (Split-Path $kf -Leaf)) -ForegroundColor Red
+foreach ($sf in $startupFolders) {
+    if (Test-Path $sf) {
+        $items = Get-ChildItem $sf -Force -ErrorAction SilentlyContinue
+        if ($items) {
+            foreach ($item in $items) {
+                Write-Finding "Startup folder item: $($item.Name) in $sf" "Medium"
+                Add-Finding "Persistence" "Startup folder entry" "Medium" $item.FullName
+                Add-IOC "Persistence" "StartupFolder" $item.FullName
+            }
+        } else { Write-Host "    $sf`: Empty" -ForegroundColor Green }
     }
 }
 
 # ============================================================
-# DONE
+# SECTION 9: NETWORK ANALYSIS
 # ============================================================
-Write-Host "`nCheck Complete, hit up @praiselily if u run into any issues." -ForegroundColor Cyan
+Write-SectionHeader "NETWORK ANALYSIS"
+
+# Listening ports
+Write-Host "  Listening Ports:" -ForegroundColor Cyan
+try {
+    $listening = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue
+    foreach ($conn in $listening | Sort-Object LocalPort) {
+        $proc = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
+        $suspicious = $conn.LocalPort -notin @(80,443,135,139,445,3389,5040,7680,49664..49670)
+        $color = if ($suspicious) { "Yellow" } else { "Green" }
+        Write-Host ("    0.0.0.0:{0,-6} PID:{1,-6} {2}" -f
+            $conn.LocalPort, $conn.OwningProcess,
+            $(if ($proc) { $proc.Name } else { "Unknown" })) -ForegroundColor $color
+    }
+} catch { Write-Finding "Unable to enumerate listening ports" "Medium" }
+
+# Established connections
+Write-Host "`n  Established Connections:" -ForegroundColor Cyan
+try {
+    $established = Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue
+    $suspiciousPorts = @(1337,4444,5555,6666,7777,8888,9999,31337,12345,54321,1080,8080)
+
+    foreach ($conn in $established) {
+        $proc = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
+        $isSuspPort = $conn.RemotePort -in $suspiciousPorts -or $conn.LocalPort -in $suspiciousPorts
+        $color = if ($isSuspPort) { "Red" } else { "White" }
+
+        Write-Host ("    {0}:{1} -> {2}:{3}  PID:{4} {5}" -f
+            $conn.LocalAddress, $conn.LocalPort,
+            $conn.RemoteAddress, $conn.RemotePort,
+            $conn.OwningProcess,
+            $(if ($proc) { $proc.Name } else { "Unknown" })) -ForegroundColor $color
+
+        if ($isSuspPort) {
+            Write-Finding "Connection on suspicious port: $($conn.RemoteAddress):$($conn.RemotePort)" "High"
+            Add-Finding "Network" "Suspicious port connection" "High" "$($conn.RemoteAddress):$($conn.RemotePort)"
+            Add-IOC "NetworkIOC" "$($conn.RemoteAddress):$($conn.RemotePort)" "Suspicious port"
+        }
+    }
+    Write-Host "    Total established: $($established.Count)" -ForegroundColor White
+} catch { Write-Finding "Unable to enumerate established connections" "Medium" }
+
+# DNS Cache
+Write-Host "`n  DNS Cache (top 30):" -ForegroundColor Cyan
+try {
+    $dnsCache = Get-DnsClientCache -ErrorAction SilentlyContinue | Select-Object -First 30
+    $suspDomains = @("ngrok","burpcollaborator","requestbin","hookbin","interactsh",
+                     "pastebin","paste.ee","hastebin","transfer.sh","anonfiles")
+    foreach ($entry in $dnsCache) {
+        $isSusp = $false
+        foreach ($sd in $suspDomains) {
+            if ($entry.Name -ilike "*$sd*") { $isSusp = $true; break }
+        }
+        $color = if ($isSusp) { "Red" } else { "White" }
+        Write-Host ("    {0}" -f $entry.Name) -ForegroundColor $color
+        if ($isSusp) {
+            Write-Finding "Suspicious DNS entry: $($entry.Name)" "High"
+            Add-IOC "NetworkIOC" $entry.Name "Suspicious DNS cache entry"
+        }
+    }
+} catch { Write-Finding "Unable to read DNS cache" "Low" }
+
+# Hosts file
+Write-Host "`n  Hosts File:" -ForegroundColor Cyan
+try {
+    $hostsPath    = "$env:SystemRoot\System32\drivers\etc\hosts"
+    $hostsContent = Get-Content $hostsPath -ErrorAction SilentlyContinue |
+        Where-Object { $_ -notmatch "^#" -and $_.Trim() -ne "" }
+    if ($hostsContent) {
+        foreach ($line in $hostsContent) {
+            Write-Host "    $line" -ForegroundColor Yellow
+            Add-Finding "Network" "Hosts file entry: $line" "Medium" "Non-default hosts file entry"
+        }
+    } else { Write-Host "    Hosts file: Clean (default only)" -ForegroundColor Green }
+} catch { Write-Finding "Unable to read hosts file" "Low" }
+
+# Proxy settings
+Write-Host "`n  Proxy Configuration:" -ForegroundColor Cyan
+try {
+    $proxy = Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" -ErrorAction SilentlyContinue
+    if ($proxy.ProxyEnable -eq 1) {
+        Write-Finding "Proxy enabled: $($proxy.ProxyServer)" "Medium"
+        Add-Finding "Network" "Proxy configured" "Medium" $proxy.ProxyServer
+        Add-IOC "NetworkConfig" $proxy.ProxyServer "Proxy server"
+    } else { Write-Host "    No proxy configured" -ForegroundColor Green }
+} catch { Write-Finding "Unable to read proxy settings" "Low" }
+
+# Network adapters
+Write-Host "`n  Network Adapters:" -ForegroundColor Cyan
+try {
+    $adapters = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq "Up" }
+    foreach ($a in $adapters) {
+        $ip = Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
+        Write-Host ("    {0,-25} MAC:{1}  IP:{2}" -f
+            $a.Name, $a.MacAddress, ($ip.IPAddress -join ",")) -ForegroundColor White
+
+        # VPN adapter detection
+        if ($a.Name -ilike "*vpn*" -or $a.Name -ilike "*tun*" -or $a.Name -ilike "*tap*") {
+            Write-Finding "VPN/Tunnel adapter detected: $($a.Name)" "Medium"
+            Add-Finding "Network" "VPN adapter present" "Medium" $a.Name
+        }
+    }
+} catch { Write-Finding "Unable to enumerate network adapters" "Low" }
+
+# ARP cache
+Write-Host "`n  ARP Cache:" -ForegroundColor Cyan
+try {
+    $arpCache = Get-NetNeighbor -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.State -ne "Unreachable" } | Select-Object -First 20
+    foreach ($arp in $arpCache) {
+        Write-Host ("    {0,-20} {1}" -f $arp.IPAddress, $arp.LinkLayerAddress) -ForegroundColor White
+    }
+} catch { Write-Finding "Unable to read ARP cache" "Low" }
+
+# SMB Sessions and shares
+Write-Host "`n  SMB Sessions:" -ForegroundColor Cyan
+try {
+    $smbSessions = Get-SmbSession -ErrorAction SilentlyContinue
+    if ($smbSessions) {
+        foreach ($s in $smbSessions) {
+            Write-Finding "Active SMB session: $($s.ClientComputerName) 
