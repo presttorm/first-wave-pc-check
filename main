@@ -1,4 +1,33 @@
 #Requires -Version 5.1
+<#
+.SYNOPSIS
+    AC-Triage.ps1 — Professional Windows Anti-Cheat Forensic Triage Tool
+    Made with love by lily<3 | Extended by DFIR engineering
+
+.DESCRIPTION
+    Read-only forensic collection and analysis tool for investigating:
+    - Cheat software and game manipulation tools
+    - Unauthorized automation (input bots, macro tools)
+    - Kernel-level tampering (unsigned/hidden drivers, rootkits)
+    - Suspicious persistence mechanisms
+    - Evidence of artifact tampering or log wiping
+
+    This script collects and correlates artifacts from:
+    Process memory, drivers, services, registry, event logs, filesystem,
+    network state, browser history, Defender telemetry, and Windows security config.
+
+    DESIGN PRINCIPLES:
+    - Read-only: no system state is modified
+    - Correlated: no single indicator triggers a finding; multiple artifacts are required
+    - Contextual: benign explanations are considered for every indicator
+    - Confidence-scored: findings rated Informational / Low / Medium / High / Critical
+    - Graceful: all errors are caught; missing data is noted, not fatal
+
+.NOTES
+    Requires: Administrator privileges
+    Tested on: Windows 10 21H2+, Windows 11
+    Execution Policy: Run with -ExecutionPolicy Bypass if needed
+#>
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'SilentlyContinue'
@@ -774,7 +803,7 @@ if ($gameProcsFound.Count -eq 0) {
         Write-Host "`n  Game process: $($gameProc.Name) (PID $($gameProc.Id))" -ForegroundColor Cyan
 
         try {
-            $modules = $gameProc.Modules -ErrorAction Stop
+            $modules = $gameProc.Modules
             $suspiciousModules = @()
 
             foreach ($mod in $modules) {
@@ -2521,7 +2550,7 @@ function Get-ChromiumDownloads {
                 Write-Host ("  {0}: {1} cheat-related download URL(s) found in history" -f $BrowserName, $cheatUrls.Count) -ForegroundColor Red
                 foreach ($url in $cheatUrls) {
                     Write-Host "    $url" -ForegroundColor Red
-                    Add-Finding -Category 'Browser' -Title "$BrowserName: Cheat-Related Download URL" `
+                    Add-Finding -Category 'Browser' -Title "${BrowserName}: Cheat-Related Download URL" `
                         -Evidence "URL: $url" `
                         -WhySuspicious "Download URL matching cheat keyword found in browser history. This indicates the user actively downloaded what may be cheat software." `
                         -BenignExplanation "URL may coincidentally match keyword; game mod download; false positive" `
