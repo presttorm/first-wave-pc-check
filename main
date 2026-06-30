@@ -2,7 +2,6 @@
 <#
 .SYNOPSIS
     AC-Triage.ps1 — Professional Windows Anti-Cheat Forensic Triage Tool
-    Made with love by lily<3 | Extended by DFIR engineering
 
 .DESCRIPTION
     Read-only forensic collection and analysis tool for investigating:
@@ -48,7 +47,7 @@ if (-not $isAdmin) {
     exit 1
 }
 
-Write-Host "made with love by lily<3" -ForegroundColor Cyan
+Write-Host "made by lily-modified/extended by prestorm" -ForegroundColor Cyan
 Write-Host ""
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2794,4 +2793,4 @@ Write-Host "  9. Review game anti-cheat logs (EAC, BattlEye) for detection event
 Write-Host " 10. Correlate timestamps with game session logs (match time zones carefully)" -ForegroundColor White
 Write-Host ""
 
-Write-Host "Check Complete, hit up @presttorm if u run into any issues." -ForegroundColor Cyan
+Write-Host "Check Complete, hit up @praiselily if u run into any issues." -ForegroundColor Cyan
